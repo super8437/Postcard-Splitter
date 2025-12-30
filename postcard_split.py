@@ -111,7 +111,7 @@ def build_bgmask(gray_s):
 
 
 # ============================================================
-# Seam detection (axis-agnostic)
+# Seam detection
 # ============================================================
 
 def vertical_edge_map(gray_s):
@@ -121,9 +121,7 @@ def vertical_edge_map(gray_s):
 
 
 def detect_card_boxes(gray_s, bgmask, axis):
-    # foreground = non-background
     fg = ~bgmask
-
     labels, n = ndi.label(fg)
     if n < 2:
         return None
@@ -131,23 +129,18 @@ def detect_card_boxes(gray_s, bgmask, axis):
     slices = ndi.find_objects(labels)
     candidates = []
 
-    H, W = gray_s.shape
-
     for sl in slices:
         h = sl[0].stop - sl[0].start
         w = sl[1].stop - sl[1].start
-
-        if plausible_postcard_dims(w * 2, h * 2):  # account for downsample
+        if plausible_postcard_dims(w * 2, h * 2):
             candidates.append((sl, w * h))
 
     if len(candidates) < 2:
         return None
 
-    # Keep two largest
     candidates.sort(key=lambda x: x[1], reverse=True)
     (sl1, _), (sl2, _) = candidates[:2]
 
-    # Compute gap between boxes (axis-explicit)
     if axis == "vertical":
         gap_start = min(sl1[1].stop, sl2[1].stop)
         gap_end = max(sl1[1].start, sl2[1].start)
@@ -158,8 +151,7 @@ def detect_card_boxes(gray_s, bgmask, axis):
     if gap_end <= gap_start:
         return None
 
-    gap_width = gap_end - gap_start
-    if gap_width < 0.03 * W:
+    if (gap_end - gap_start) < 0.03 * gray_s.shape[1]:
         return None
 
     return (gap_start + gap_end) // 2
@@ -170,20 +162,14 @@ def find_boundary(gray_s, color_s, bgmask, axis, filename=None, orig_shape=None)
     if Hs < 40 or Ws < 40:
         return None
 
-    # Structural detection shortcut:
-    # If two postcard-sized regions are detected, split between them
-    # instead of using edge-based seam detection.
-    structural_split = detect_card_boxes(gray_s, bgmask, axis)
-    if structural_split is not None:
+    structural = detect_card_boxes(gray_s, bgmask, axis)
+    if structural is not None:
         log_debug(filename, axis, "structural detection used")
-        return structural_split, 1.0
+        return structural, 1.0
 
-    band_top = int(0.15 * Hs)
-    band_bot = int(0.85 * Hs)
-    band = slice(band_top, band_bot)
-
-    band_gray = gray_s[band].astype(np.float32)
-    band_color = color_s[band].astype(np.float32)
+    band = slice(int(0.15 * Hs), int(0.85 * Hs))
+    band_gray = gray_s[band]
+    band_color = color_s[band]
 
     margin = max(4, int(0.07 * Ws))
     idx = np.arange(margin, Ws - margin)
@@ -191,168 +177,100 @@ def find_boundary(gray_s, color_s, bgmask, axis, filename=None, orig_shape=None)
         return None
 
     edge = vertical_edge_map(gray_s)[band]
-    weak_thr = np.percentile(edge, 60)
-    strong_thr = np.percentile(edge, 90)
+    seam_align = ((edge >= np.percentile(edge, 60)) &
+                  (edge <= np.percentile(edge, 90))).mean(axis=0)
+    strong_align = (edge >= np.percentile(edge, 90)).mean(axis=0)
 
-    seam_mask = (edge >= weak_thr) & (edge <= strong_thr)
-    strong_mask = edge >= strong_thr
-
-    seam_align = seam_mask.mean(axis=0)
-    strong_align = strong_mask.mean(axis=0)
     bg_ratio = bgmask[band].mean(axis=0)
     ink_ratio = (gray_s[band] < INK_THRESHOLD).mean(axis=0)
-    # NOTE:
-    # bg_ratio enforces that seams pass through background (gaps),
-    # not internal printed lines. ink_ratio suppresses text, dividers,
-    # and structural features (e.g., bridges).
-    # Geometry is a hard gate:
-    # seams that cannot produce two plausible postcards
-    # must not participate in scoring.
 
     col_mean = band_color.mean(axis=0)
-    col_gray = band_gray.mean(axis=0)
     col_sq = (band_gray ** 2).mean(axis=0)
 
     cumsum = np.vstack([np.zeros((1, 3)), np.cumsum(col_mean, axis=0)])
-    cumsum_g = np.concatenate([[0.0], np.cumsum(col_gray)])
     cumsum_sq = np.concatenate([[0.0], np.cumsum(col_sq)])
 
-    band_w = int(np.clip(0.04 * Ws, 6, 40))
+    bw = int(np.clip(0.04 * Ws, 6, 40))
+    l = np.clip(idx - bw, 0, Ws)
+    r = np.clip(idx + bw, 0, Ws)
 
-    def band_stats(start, end):
-        w = np.maximum(1, end - start)
-        mean = (cumsum[end] - cumsum[start]) / w[:, None]
-        g = (cumsum_g[end] - cumsum_g[start]) / w
-        v = (cumsum_sq[end] - cumsum_sq[start]) / w - g ** 2
-        return mean, g, np.clip(v, 0, None)
+    mean_l = (cumsum[idx] - cumsum[l]) / np.maximum(1, idx - l)[:, None]
+    mean_r = (cumsum[r] - cumsum[idx]) / np.maximum(1, r - idx)[:, None]
 
-    left_s = np.clip(idx - band_w, 0, Ws)
-    right_e = np.clip(idx + band_w, 0, Ws)
-
-    l_mean, l_g, l_v = band_stats(left_s, idx)
-    r_mean, r_g, r_v = band_stats(idx, right_e)
-
-    dissim = (
-        np.mean(np.abs(l_mean - r_mean), axis=1)
-        + 0.6 * np.sqrt(np.abs(l_v - r_v))
-    )
-    dis_thr = max(18.0, np.percentile(dissim, 78))
+    dissim = np.mean(np.abs(mean_l - mean_r), axis=1)
     anchor = int(idx[np.argmax(dissim)])
 
-    # align all signals
-    d = dissim
-    c = bg_ratio[idx]
-    s = seam_align[idx]
-    st = strong_align[idx]
+    scale = orig_shape[1] / gray_s.shape[1] if orig_shape else 2.0
 
-    scale = (orig_shape[1] / gray_s.shape[1]) if orig_shape else 2.0
-
-    geom_valid = np.zeros_like(idx, dtype=bool)
-    for i, s_idx in enumerate(idx):
-        lw = s_idx
-        rw = Ws - s_idx
+    geom_ok = []
+    for s in idx:
+        lw, rw = s, Ws - s
         if axis == "vertical":
-            left_dims = (lw * scale, Hs * scale)
-            right_dims = (rw * scale, Hs * scale)
+            geom_ok.append(
+                plausible_postcard_dims(lw * scale, Hs * scale) and
+                plausible_postcard_dims(rw * scale, Hs * scale)
+            )
         else:
-            left_dims = (Ws * scale, lw * scale)
-            right_dims = (Ws * scale, rw * scale)
+            geom_ok.append(
+                plausible_postcard_dims(Ws * scale, lw * scale) and
+                plausible_postcard_dims(Ws * scale, rw * scale)
+            )
 
-        geom_ok = (
-            plausible_postcard_dims(*left_dims) and
-            plausible_postcard_dims(*right_dims)
-        )
-        if geom_ok:
-            geom_valid[i] = True
+    geom_ok = np.array(geom_ok, dtype=bool)
 
     valid = (
-        (d >= dis_thr) &
-        (c >= 0.60) &
+        (bg_ratio[idx] >= 0.60) &
         (ink_ratio[idx] <= 0.25) &
-        (s >= 0.35) &
-        (st <= 0.22)
+        (seam_align[idx] >= 0.35) &
+        (strong_align[idx] <= 0.22) &
+        geom_ok
     )
-    valid = valid & geom_valid
 
     if not np.any(valid):
-        log_debug(filename, axis, "no geometry-valid candidates; entering retry")
-        best = None
-    else:
-        score = (
-            0.5 * np.clip((d - dis_thr) / (dis_thr + 25), 0, 1) +
-            0.3 * np.clip((c - 0.6) / 0.4, 0, 1) +
-            0.2 * np.clip((s - 0.35) / 0.3, 0, 1)
-        )
-        score *= valid
+         # Fallback to dissimilarity anchor if geometry is valid
+         lw = anchor
+         rw = Ws - anchor
 
+    if axis == "vertical":
+        geom_ok = (
+            plausible_postcard_dims(lw * scale, Hs * scale) and
+            plausible_postcard_dims(rw * scale, Hs * scale)
+        )
+    else:
+        geom_ok = (
+            plausible_postcard_dims(Ws * scale, lw * scale) and
+            plausible_postcard_dims(Ws * scale, rw * scale)
+        )
+
+    if geom_ok:
+        log_debug(filename, axis, "fallback to dissimilarity anchor")
+        return anchor, 0.20  # low but non-zero confidence
+
+    return None
+
+    else:
+        score = bg_ratio[idx] * valid
         best = np.argmax(score)
         split = int(idx[best])
         confidence = float(score[best])
 
+    # Retry sweep
+    best = None
+    best_score = -1
+    for dx in range(-RETRY_RADIUS_PX, RETRY_RADIUS_PX + 1, RETRY_STEP_PX):
+        s = split + dx
+        if s <= 0 or s >= Ws:
+            continue
+        if bg_ratio[s] >= 0.60 and ink_ratio[s] <= 0.25:
+            score = bg_ratio[s] - abs(dx) / RETRY_RADIUS_PX
+            if score > best_score:
+                best_score = score
+                best = s
+
     if best is None:
-        split = anchor
-        confidence = 0.0
+        return None
 
-    left_w = split
-    right_w = Ws - split
-
-    needs_retry = (
-        best is None or
-        confidence < CONFIDENCE_SOFT_THRESHOLD or
-        not (
-            plausible_postcard_dims(*( (left_w * scale, Hs * scale) if axis == "vertical" else (Ws * scale, left_w * scale) )) and
-            plausible_postcard_dims(*( (right_w * scale, Hs * scale) if axis == "vertical" else (Ws * scale, right_w * scale) ))
-        )
-    )
-
-    retry_candidates = []
-    if needs_retry:
-        if best is None:
-            log_debug(filename, axis, "retry due to missing initial candidate")
-        elif confidence < CONFIDENCE_SOFT_THRESHOLD:
-            log_debug(filename, axis, "retry due to low confidence")
-        else:
-            log_debug(filename, axis, "retry due to geometry failure")
-
-        for dx in range(-RETRY_RADIUS_PX, RETRY_RADIUS_PX + 1, RETRY_STEP_PX):
-            s_local = split + dx
-            if s_local <= 0 or s_local >= Ws:
-                continue
-
-            lw = s_local
-            rw = Ws - s_local
-
-            if axis == "vertical":
-                left_dims = (lw * scale, Hs * scale)
-                right_dims = (rw * scale, Hs * scale)
-            else:
-                left_dims = (Ws * scale, lw * scale)
-                right_dims = (Ws * scale, rw * scale)
-
-            if not (
-                plausible_postcard_dims(*left_dims) and
-                plausible_postcard_dims(*right_dims)
-            ):
-                continue
-
-            if bg_ratio[s_local] >= 0.60 and ink_ratio[s_local] <= 0.25:
-                retry_score = (
-                    0.6 * bg_ratio[s_local] +
-                    0.3 * (1.0 - ink_ratio[s_local]) +
-                    0.1 * (1.0 - abs(s_local - anchor) / RETRY_RADIUS_PX)
-                )
-                retry_candidates.append((retry_score, s_local))
-
-        if not retry_candidates:
-            log_debug(filename, axis, "retry exhausted without candidates")
-            return None
-
-        retry_candidates.sort(key=lambda x: x[0], reverse=True)
-        split = retry_candidates[0][1]
-
-    # Physical plausibility (geometry + background)
-    # overrides statistical confidence.
-    return split, confidence
+    return best, best_score
 
 
 # ============================================================
@@ -367,37 +285,30 @@ def split_once(img, axis, filename=None):
         color = color.transpose(1, 0, 2)
         gray = gray.T
 
-    color_s = color[::2, ::2]
     gray_s = gray[::2, ::2]
+    color_s = color[::2, ::2]
 
     bgmask = build_bgmask(gray_s)
-    result = find_boundary(
-        gray_s,
-        color_s,
-        bgmask,
-        axis,
-        filename=filename,
-        orig_shape=gray.shape,
-    )
+    result = find_boundary(gray_s, color_s, bgmask, axis, filename, gray.shape)
 
     if not result:
         return [img.copy()]
 
-    split_s, conf = result
+    split_s, _ = result
     scale = gray.shape[1] / gray_s.shape[1]
     split = int(round(split_s * scale))
-
-    H, W = gray.shape
-    overlap = max(16, int(0.01 * W))
+    overlap = max(16, int(0.01 * gray.shape[1]))
 
     if axis == "horizontal":
-        top = img.crop((0, 0, img.width, split + overlap))
-        bot = img.crop((0, max(0, split - overlap), img.width, img.height))
-        return [top, bot]
+        return [
+            img.crop((0, 0, img.width, split + overlap)),
+            img.crop((0, max(0, split - overlap), img.width, img.height))
+        ]
 
-    left = img.crop((0, 0, split + overlap, img.height))
-    right = img.crop((max(0, split - overlap), 0, img.width, img.height))
-    return [left, right]
+    return [
+        img.crop((0, 0, split + overlap, img.height)),
+        img.crop((max(0, split - overlap), 0, img.width, img.height))
+    ]
 
 
 # ============================================================
@@ -406,46 +317,54 @@ def split_once(img, axis, filename=None):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python postcard_split.py <scan1> <scan2> ...")
+        print("Usage: python postcard_split.py <image_or_directory> ...")
+        sys.exit(1)
+
+    inputs = [Path(p) for p in sys.argv[1:]]
+    scans = []
+
+    for p in inputs:
+        if p.is_dir():
+            scans.extend(sorted(
+                f for f in p.iterdir()
+                if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".tif", ".tiff")
+            ))
+        elif p.is_file():
+            scans.append(p)
+
+    if not scans:
+        print("No image files found.")
         sys.exit(1)
 
     out_root = Path("output")
     out_root.mkdir(exist_ok=True)
-
-    scans = [Path(p) for p in sys.argv[1:]]
 
     BACK_MIRROR_MAP = {1: 2, 2: 1, 3: 4, 4: 3}
 
     for scan_idx, scan_path in enumerate(scans):
         img = Image.open(scan_path)
 
-        # Determine role purely by sequence
         is_front = (scan_idx % 2 == 0)
         pair_id = scan_idx // 2 + 1
 
         out_dir = out_root / f"pair_{pair_id:03d}"
         out_dir.mkdir(exist_ok=True)
 
-        # ---- split (unchanged logic) ----
         parts = []
-        for half in split_once(img, "horizontal", filename=scan_path.name):
-            parts.extend(split_once(half, "vertical", filename=scan_path.name))
+        for half in split_once(img, "horizontal", scan_path.name):
+            parts.extend(split_once(half, "vertical", scan_path.name))
 
         if len(parts) != 4:
             print(f"WARNING: {scan_path.name} produced {len(parts)} parts")
 
-        # ---- naming logic ----
         for idx, p in enumerate(parts, 1):
             if is_front:
                 fname = f"postcard_{idx}_front.jpg"
             else:
-                paired_idx = BACK_MIRROR_MAP[idx]
-                fname = f"postcard_{paired_idx}_back.jpg"
-
+                fname = f"postcard_{BACK_MIRROR_MAP[idx]}_back.jpg"
             p.save(out_dir / fname, quality=95)
 
-        role = "front" if is_front else "back"
-        print(f"[OK] {scan_path.name} → {role} (pair {pair_id})")
+        print(f"[OK] {scan_path.name}")
 
     print("All scans processed.")
 
