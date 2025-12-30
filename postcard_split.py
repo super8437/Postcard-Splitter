@@ -94,7 +94,7 @@ def build_bg_and_depth(gray_s, bg_mode, border):
 
 
 # ----------------------------
-# edge-based white vertical logic
+# seam evidence
 # ----------------------------
 
 def vertical_edge_map(gray_s):
@@ -105,6 +105,9 @@ def vertical_edge_map(gray_s):
 
 def find_vertical_boundary(gray_s, color_s, bgmask):
     Hs, Ws = gray_s.shape
+    if Ws < 40 or Hs < 40:
+        return None
+
     band_top = max(0, int(0.15 * Hs))
     band_bot = min(Hs, int(0.85 * Hs))
     if band_bot - band_top < 10:
@@ -114,11 +117,14 @@ def find_vertical_boundary(gray_s, color_s, bgmask):
     band_gray = gray_s[band_slice].astype(np.float32)
     band_color = color_s[band_slice].astype(np.float32)
 
-    edge = vertical_edge_map(gray_s)
-    edge_band = edge[band_slice]
+    margin = max(4, int(0.07 * Ws))
+    candidate_idx = np.arange(margin, Ws - margin)
+    if candidate_idx.size == 0:
+        return None
 
-    weak_thr = float(np.percentile(edge_band, 55))
-    strong_thr = float(np.percentile(edge_band, 92))
+    edge_band = vertical_edge_map(gray_s)[band_slice]
+    weak_thr = float(np.percentile(edge_band, 60))
+    strong_thr = float(np.percentile(edge_band, 90))
 
     seam_mask = (edge_band >= weak_thr) & (edge_band <= strong_thr)
     strong_mask = edge_band >= strong_thr
@@ -138,7 +144,7 @@ def find_vertical_boundary(gray_s, color_s, bgmask):
     cumsum_gray = np.concatenate([[0.0], np.cumsum(col_mean_gray)])
     cumsum_sq = np.concatenate([[0.0], np.cumsum(col_sq_mean)])
 
-    band_w = max(4, int(0.03 * Ws))
+    band_w = max(6, int(0.04 * Ws))
     idx = np.arange(Ws)
 
     left_start = np.clip(idx - band_w, 0, Ws)
@@ -165,35 +171,48 @@ def find_vertical_boundary(gray_s, color_s, bgmask):
 
     mean_diff = np.mean(np.abs(left_mean - right_mean), axis=1)
     var_diff = np.abs(left_var - right_var)
-    dissimilarity = mean_diff + 0.5 * np.sqrt(var_diff)
+    dissimilarity = mean_diff + 0.6 * np.sqrt(var_diff)
 
-    dissimilarity_thr = max(12.0, float(np.percentile(dissimilarity, 70)))
+    dissimilarity_thr = max(18.0, float(np.percentile(dissimilarity, 78)))
+
     dissimilarity_gate = dissimilarity >= dissimilarity_thr
+    continuity_gate = continuity >= 0.60
+    alignment_gate = seam_alignment >= 0.35
+    strong_gate = strong_alignment <= 0.22
 
-    continuity_gate = continuity >= 0.70
-    alignment_gate = seam_alignment >= 0.45
-    strong_gate = strong_alignment <= 0.20
+    candidate = (
+        dissimilarity_gate &
+        continuity_gate &
+        alignment_gate &
+        strong_gate
+    )
 
-    candidate = dissimilarity_gate & continuity_gate & alignment_gate & strong_gate
+    candidate &= np.isin(idx, candidate_idx)
     if not np.any(candidate):
         return None
 
-    dissimilarity_strength = np.clip((dissimilarity - dissimilarity_thr) / (dissimilarity_thr + 20.0), 0.0, 1.0)
-    continuity_strength = np.clip((continuity - 0.70) / 0.30, 0.0, 1.0)
-    alignment_strength = np.clip((seam_alignment - 0.45) / 0.35, 0.0, 1.0)
+    dissimilarity_strength = np.clip((dissimilarity - dissimilarity_thr) / (dissimilarity_thr + 25.0), 0.0, 1.0)
+    continuity_strength = np.clip((continuity - 0.60) / 0.35, 0.0, 1.0)
+    alignment_strength = np.clip((seam_alignment - 0.35) / 0.30, 0.0, 1.0)
+
+    center_bias = 1.0 - np.abs(idx - Ws / 2) / (Ws / 2)
+    center_bias = np.clip(center_bias, 0.0, 1.0)
+
     strong_penalty = np.clip(1.0 - strong_alignment / 0.25, 0.0, 1.0)
 
     score = (
-        0.45 * dissimilarity_strength +
-        0.30 * continuity_strength +
-        0.25 * alignment_strength
-    ) * strong_penalty
-
+        0.50 * dissimilarity_strength +
+        0.25 * continuity_strength +
+        0.15 * alignment_strength +
+        0.10 * center_bias
+    )
+    score *= strong_penalty
     score *= candidate
+
     split = int(np.argmax(score))
     confidence = float(score[split])
 
-    if confidence <= 0.0:
+    if confidence < 0.15:
         return None
 
     return split, confidence
@@ -203,22 +222,10 @@ def find_vertical_boundary(gray_s, color_s, bgmask):
 # splitting
 # ----------------------------
 
-def horizontal_split(img):
+def split_postcards(img):
+    color = np.array(img.convert("RGB"))
     gray = np.array(img.convert("L"))
-    H, W = gray.shape
-    gray_s = gray[::2, ::2]
 
-    bg_mode, _ = classify_background(gray_s)
-
-    y = H // 2
-    print(f"[Step 1] bg={bg_mode}, y_split={y}")
-    return img.crop((0, 0, W, y)), img.crop((0, y, W, H))
-
-
-def vertical_split(half_img, tag):
-    color = np.array(half_img.convert("RGB"))
-    gray = np.array(half_img.convert("L"))
-    H, W = gray.shape
     color_s = color[::2, ::2]
     gray_s = gray[::2, ::2]
 
@@ -227,16 +234,19 @@ def vertical_split(half_img, tag):
 
     result = find_vertical_boundary(gray_s, color_s, bgmask)
     if not result:
-        print(f"[Step 2:{tag}] no-split (no proven boundary)")
-        return [half_img.copy()]
+        print("[Split] no-split (no proven vertical boundary)")
+        return [img.copy()]
 
     x_s, conf = result
-    x = int(x_s * 2)
-    print(f"[Step 2:{tag}] split x={x} conf={conf:.3f}")
+    scale_x = gray.shape[1] / gray_s.shape[1]
+    x = int(round(x_s * scale_x))
+    H, W = gray.shape
 
-    overlap = max(20, int(0.01 * W))
-    left = half_img.crop((0, 0, min(W, x + overlap), H))
-    right = half_img.crop((max(0, x - overlap), 0, W, H))
+    overlap = max(16, int(0.01 * W))
+    left = img.crop((0, 0, min(W, x + overlap), H))
+    right = img.crop((max(0, x - overlap), 0, W, H))
+
+    print(f"[Split] split x={x} conf={conf:.3f}")
     return [left.copy(), right.copy()]
 
 
@@ -253,10 +263,7 @@ def main():
     out = Path("output")
     out.mkdir(exist_ok=True)
 
-    top, bottom = horizontal_split(img)
-    parts = []
-    parts.extend(vertical_split(top, "top"))
-    parts.extend(vertical_split(bottom, "bottom"))
+    parts = split_postcards(img)
 
     for idx, postcard in enumerate(parts, start=1):
         postcard.save(out / f"postcard_{idx}.jpg", quality=95)
