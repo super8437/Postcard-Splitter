@@ -227,32 +227,31 @@ def find_boundary(gray_s, color_s, bgmask, axis, filename=None, orig_shape=None)
     )
 
     if not np.any(valid):
-         # Fallback to dissimilarity anchor if geometry is valid
-         lw = anchor
-         rw = Ws - anchor
+        # Fallback to dissimilarity anchor if geometry is valid
+        lw = anchor
+        rw = Ws - anchor
 
-    if axis == "vertical":
-        geom_ok = (
-            plausible_postcard_dims(lw * scale, Hs * scale) and
-            plausible_postcard_dims(rw * scale, Hs * scale)
-        )
-    else:
-        geom_ok = (
-            plausible_postcard_dims(Ws * scale, lw * scale) and
-            plausible_postcard_dims(Ws * scale, rw * scale)
-        )
+        if axis == "vertical":
+            geom_ok = (
+                plausible_postcard_dims(lw * scale, Hs * scale) and
+                plausible_postcard_dims(rw * scale, Hs * scale)
+            )
+        else:
+            geom_ok = (
+                plausible_postcard_dims(Ws * scale, lw * scale) and
+                plausible_postcard_dims(Ws * scale, rw * scale)
+            )
 
-    if geom_ok:
-        log_debug(filename, axis, "fallback to dissimilarity anchor")
-        return anchor, 0.20  # low but non-zero confidence
+        if geom_ok:
+            log_debug(filename, axis, "fallback to dissimilarity anchor")
+            return anchor, 0.20  # low but non-zero confidence
 
-    return None
+        return None
 
-    else:
-        score = bg_ratio[idx] * valid
-        best = np.argmax(score)
-        split = int(idx[best])
-        confidence = float(score[best])
+    score = bg_ratio[idx] * valid
+    best = np.argmax(score)
+    split = int(idx[best])
+    confidence = float(score[best])
 
     # Retry sweep
     best = None
