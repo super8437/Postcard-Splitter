@@ -108,6 +108,7 @@ def find_vertical_split_white(gray_s, bgmask, white_t, depth):
 
     edge = vertical_edge_map(gray_s)
     col_edge = edge.mean(axis=0)
+    col_mean = gray_s.mean(axis=0)
 
     norm = max(1e-3, np.percentile(col_edge, 90))
     edge_density = np.clip(col_edge / norm, 0, 1)
@@ -119,6 +120,30 @@ def find_vertical_split_white(gray_s, bgmask, white_t, depth):
     low_edge = edge <= np.percentile(edge, 35)
     stable_gap = np.mean(bgmask & low_edge, axis=0)
 
+    band = max(3, int(0.01 * Ws))
+    idx = np.arange(Ws)
+    col_cumsum = np.concatenate([[0.0], np.cumsum(col_mean)])
+
+    left_start = np.maximum(0, idx - band)
+    left_end = idx
+    left_sum = col_cumsum[left_end + 1] - col_cumsum[left_start]
+    left_width = np.maximum(1, left_end - left_start)
+    left_mean = left_sum / left_width
+
+    right_start = idx
+    right_end = np.minimum(Ws, idx + band)
+    right_sum = col_cumsum[right_end] - col_cumsum[right_start]
+    right_width = np.maximum(1, right_end - right_start)
+    right_mean = right_sum / right_width
+
+    contrast = np.abs(left_mean - right_mean)
+    contrast_thr = 10.0
+    contrast_gate = contrast >= contrast_thr
+    contrast_norm = np.clip((contrast - contrast_thr) / max(1.0, contrast_thr), 0, 1)
+
+    continuity = np.mean(bgmask, axis=0)
+    continuity_gate = continuity >= 0.25
+
     center = np.linspace(-1, 1, Ws)
     center_bias = 1.0 - np.abs(center)
 
@@ -127,7 +152,9 @@ def find_vertical_split_white(gray_s, bgmask, white_t, depth):
         0.45 * edge_absence +
         0.10 * center_bias
     )
+    score *= (0.5 + 0.5 * contrast_norm)
     score *= (0.5 + 0.5 * stable_gap)
+    score *= contrast_gate & continuity_gate
 
     strong_edge = edge_density >= 0.6
     dilate = max(2, int(0.006 * Ws))
@@ -138,7 +165,7 @@ def find_vertical_split_white(gray_s, bgmask, white_t, depth):
     if idx.size == 0:
         return None
 
-    split = int(np.median(idx))
+    split = int(idx[np.argmax(score[idx])])
     confidence = (
         float(score[split]) *
         (1.0 - edge_density[split]) *
@@ -180,7 +207,7 @@ def vertical_split(half_img, tag):
             return half_img.copy(), half_img.copy()
 
         x_s, conf = result
-        if conf < 0.03:
+        if conf < 0.07:
             print(f"[Step 2:{tag}] no-split (conf={conf:.3f})")
             return half_img.copy(), half_img.copy()
 
