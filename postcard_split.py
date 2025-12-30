@@ -56,12 +56,11 @@ def thresholds_from_border(bg_mode, border_pixels):
 def connected_bg_mask(gray_s, mode, thr_value):
     if mode == "white":
         cand = gray_s >= thr_value
-        border_value = True
     else:
         cand = gray_s <= thr_value
-        border_value = True
 
-    cand = ndi.binary_closing(cand, structure=np.ones((5, 5), dtype=bool), border_value=border_value)
+    # Avoid injecting artificial background at the borders during morphology.
+    cand = ndi.binary_closing(cand, structure=np.ones((5, 5), dtype=bool), border_value=False)
     labels, _ = ndi.label(cand)
     border_labels = np.unique(
         np.concatenate([labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1]])
@@ -94,33 +93,36 @@ def build_bg_and_depth(gray_s, bg_mode, border_pixels):
             # if coverage is tiny, relax threshold (white: lower; black: higher)
             if cover < 0.01:
                 adj = -10 if mode == "white" else 10
-                bg2 = connected_bg_mask(gray_s, mode, thr + adj)
+                thr2 = thr + adj
+                bg2 = connected_bg_mask(gray_s, mode, thr2)
                 if float(bg2.mean()) > cover:
-                    return bg2
+                    return bg2, thr2
             # if coverage is huge, tighten threshold
             if cover > 0.90:
                 adj = 10 if mode == "white" else -10
-                bg2 = connected_bg_mask(gray_s, mode, thr + adj)
+                thr2 = thr + adj
+                bg2 = connected_bg_mask(gray_s, mode, thr2)
                 if 0.05 < float(bg2.mean()) < cover:
-                    return bg2
-            return bg
+                    return bg2, thr2
+            return bg, thr
 
-        bgmask = attempt(thr_val)
+        bgmask, thr_used = attempt(thr_val)
         depth = ndi.distance_transform_edt(bgmask.astype(np.uint8))
-        score = float(np.percentile(depth, 90)) * float(bgmask.mean() + 1e-3)
+        norm = max(gray_s.shape)
+        score = float(np.percentile(depth, 90)) / max(1.0, norm)
         if best is None or score > best[0]:
-            best = (score, mode, thr_val, bgmask, depth)
+            best = (score, mode, thr_used, bgmask, depth)
 
     if best is None:
         empty = np.zeros_like(gray_s, dtype=bool)
         return "unknown", {"WHITE_T": 230}, empty, np.zeros_like(gray_s, dtype=np.float32)
 
-    _, mode, thr_val, bgmask, depth = best
-    thr_return = {"WHITE_T": thr_val} if mode == "white" else {"BLACK_T": thr_val}
+    _, mode, thr_used, bgmask, depth = best
+    thr_return = {"WHITE_T": thr_used} if mode == "white" else {"BLACK_T": thr_used}
     return mode, thr_return, bgmask, depth
 
 
-def best_scored_run(scores, start_idx, min_len, center_penalty=0.5, threshold=0.20):
+def best_scored_run(scores, start_idx, min_len, center_penalty=0.5, threshold=0.20, axis_length=None):
     scores = np.asarray(scores, dtype=np.float32)
     thr = threshold
     ok = scores >= thr
@@ -149,7 +151,11 @@ def best_scored_run(scores, start_idx, min_len, center_penalty=0.5, threshold=0.
         mean = float(scores[a : b + 1].mean())
         mid = (a + b) / 2.0
         quality = length * mean
-        final = quality / (1.0 + center_penalty * abs((start_idx + mid) - (start_idx + len(scores) / 2)) / len(scores))
+        axis_len = axis_length if axis_length is not None else len(scores)
+        split_pos = start_idx + mid
+        center = axis_len / 2.0
+        center_dist = abs(split_pos - center) / max(1.0, axis_len)
+        final = quality / (1.0 + center_penalty * center_dist)
         cand = (final, mean, length, mid)
         if best is None or cand > best:
             best = cand
@@ -172,7 +178,12 @@ def find_split_from_depth(depth, axis):
         xs = np.r_[np.arange(x0, cx0), np.arange(cx1, x1)]
         band = depth[y0:y1, :][:, xs]
         row_score = np.mean(band >= D, axis=1)
-        run = best_scored_run(row_score, start_idx=y0, min_len=max(3, int(0.01 * Hs)))
+        run = best_scored_run(
+            row_score,
+            start_idx=y0,
+            min_len=max(3, int(0.01 * Hs)),
+            axis_length=Hs,
+        )
         return run
     else:
         # vertical split: focus near center width but allow moderate drift
@@ -180,7 +191,12 @@ def find_split_from_depth(depth, axis):
         y0, y1 = int(0.10 * Hs), int(0.90 * Hs)
         band = depth[y0:y1, x0:x1]
         col_score = np.mean(band >= D, axis=0)
-        run = best_scored_run(col_score, start_idx=x0, min_len=max(3, int(0.01 * Ws)))
+        run = best_scored_run(
+            col_score,
+            start_idx=x0,
+            min_len=max(3, int(0.01 * Ws)),
+            axis_length=Ws,
+        )
         return run
 
 
