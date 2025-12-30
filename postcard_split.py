@@ -6,9 +6,9 @@ import scipy.ndimage as ndi
 from PIL import Image
 
 
-# ----------------------------
-# background classification
-# ----------------------------
+# ============================================================
+# Background classification
+# ============================================================
 
 def classify_background(gray_s):
     Hs, Ws = gray_s.shape
@@ -47,9 +47,9 @@ def thresholds_from_border(bg_mode, border):
     }
 
 
-# ----------------------------
-# background mask + depth
-# ----------------------------
+# ============================================================
+# Background mask
+# ============================================================
 
 def connected_bg_mask(gray_s, mode, thr):
     if mode == "white":
@@ -64,38 +64,23 @@ def connected_bg_mask(gray_s, mode, thr):
         labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1]
     ]))
     border_labels = border_labels[border_labels != 0]
+
     return np.isin(labels, border_labels)
 
 
-def build_bg_and_depth(gray_s, bg_mode, border):
+def build_bgmask(gray_s):
+    bg_mode, border = classify_background(gray_s)
     thr_map = thresholds_from_border(bg_mode, border)
-    modes = [bg_mode] if bg_mode in ("white", "black") else ["white", "black"]
 
-    best = None
-    for mode in modes:
-        key = "WHITE_T" if mode == "white" else "BLACK_T"
-        if key not in thr_map:
-            continue
+    mode = bg_mode if bg_mode in ("white", "black") else "white"
+    thr = thr_map.get("WHITE_T", 230)
 
-        thr = thr_map[key]
-        bg = connected_bg_mask(gray_s, mode, thr)
-        depth = ndi.distance_transform_edt(bg.astype(np.uint8))
-        score = float(np.percentile(depth, 90)) / max(gray_s.shape)
-
-        if best is None or score > best[0]:
-            best = (score, mode, thr, bg, depth)
-
-    if best is None:
-        empty = np.zeros_like(gray_s, bool)
-        return "unknown", {"WHITE_T": 230}, empty, np.zeros_like(gray_s, float)
-
-    _, mode, thr, bg, depth = best
-    return mode, {("WHITE_T" if mode == "white" else "BLACK_T"): thr}, bg, depth
+    return connected_bg_mask(gray_s, mode, thr)
 
 
-# ----------------------------
-# seam evidence
-# ----------------------------
+# ============================================================
+# Seam detection (axis-agnostic)
+# ============================================================
 
 def vertical_edge_map(gray_s):
     g = ndi.gaussian_filter(gray_s.astype(np.float32), 1.0)
@@ -103,114 +88,89 @@ def vertical_edge_map(gray_s):
     return ndi.gaussian_filter(np.abs(gx), 1.0)
 
 
-def find_vertical_boundary(gray_s, color_s, bgmask):
+def find_boundary(gray_s, color_s, bgmask):
     Hs, Ws = gray_s.shape
-    if Ws < 40 or Hs < 40:
+    if Hs < 40 or Ws < 40:
         return None
 
-    band_top = max(0, int(0.15 * Hs))
-    band_bot = min(Hs, int(0.85 * Hs))
-    if band_bot - band_top < 10:
-        return None
+    band_top = int(0.15 * Hs)
+    band_bot = int(0.85 * Hs)
+    band = slice(band_top, band_bot)
 
-    band_slice = slice(band_top, band_bot)
-    band_gray = gray_s[band_slice].astype(np.float32)
-    band_color = color_s[band_slice].astype(np.float32)
+    band_gray = gray_s[band].astype(np.float32)
+    band_color = color_s[band].astype(np.float32)
 
     margin = max(4, int(0.07 * Ws))
-    candidate_idx = np.arange(margin, Ws - margin)
-    if candidate_idx.size == 0:
+    idx = np.arange(margin, Ws - margin)
+    if idx.size == 0:
         return None
 
-    edge_band = vertical_edge_map(gray_s)[band_slice]
-    weak_thr = float(np.percentile(edge_band, 60))
-    strong_thr = float(np.percentile(edge_band, 90))
+    edge = vertical_edge_map(gray_s)[band]
+    weak_thr = np.percentile(edge, 60)
+    strong_thr = np.percentile(edge, 90)
 
-    seam_mask = (edge_band >= weak_thr) & (edge_band <= strong_thr)
-    strong_mask = edge_band >= strong_thr
+    seam_mask = (edge >= weak_thr) & (edge <= strong_thr)
+    strong_mask = edge >= strong_thr
 
-    seam_alignment = seam_mask.mean(axis=0)
-    strong_alignment = strong_mask.mean(axis=0)
+    seam_align = seam_mask.mean(axis=0)
+    strong_align = strong_mask.mean(axis=0)
+    continuity = np.mean(bgmask[band] | seam_mask, axis=0)
 
-    bg_band = bgmask[band_slice]
-    continuity = np.mean(bg_band | seam_mask, axis=0)
+    col_mean = band_color.mean(axis=0)
+    col_gray = band_gray.mean(axis=0)
+    col_sq = (band_gray ** 2).mean(axis=0)
 
-    # left-right dissimilarity using RGB means + gray variance
-    col_mean = band_color.mean(axis=0)  # (W, 3)
-    col_mean_gray = band_gray.mean(axis=0)
-    col_sq_mean = (band_gray ** 2).mean(axis=0)
+    cumsum = np.vstack([np.zeros((1, 3)), np.cumsum(col_mean, axis=0)])
+    cumsum_g = np.concatenate([[0.0], np.cumsum(col_gray)])
+    cumsum_sq = np.concatenate([[0.0], np.cumsum(col_sq)])
 
-    cumsum = np.concatenate([np.zeros((1, 3)), np.cumsum(col_mean, axis=0)], axis=0)
-    cumsum_gray = np.concatenate([[0.0], np.cumsum(col_mean_gray)])
-    cumsum_sq = np.concatenate([[0.0], np.cumsum(col_sq_mean)])
+    band_w = int(np.clip(0.04 * Ws, 6, 40))
 
-    band_w = max(6, int(0.04 * Ws))
-    idx = np.arange(Ws)
+    def band_stats(start, end):
+        w = np.maximum(1, end - start)
+        mean = (cumsum[end] - cumsum[start]) / w[:, None]
+        g = (cumsum_g[end] - cumsum_g[start]) / w
+        v = (cumsum_sq[end] - cumsum_sq[start]) / w - g ** 2
+        return mean, g, np.clip(v, 0, None)
 
-    left_start = np.clip(idx - band_w, 0, Ws)
-    left_end = idx
-    left_width = np.maximum(1, left_end - left_start)
+    left_s = np.clip(idx - band_w, 0, Ws)
+    right_e = np.clip(idx + band_w, 0, Ws)
 
-    right_start = np.clip(idx + 1, 0, Ws)
-    right_end = np.clip(idx + band_w + 1, 0, Ws)
-    right_width = np.maximum(1, right_end - right_start)
+    l_mean, l_g, l_v = band_stats(left_s, idx)
+    r_mean, r_g, r_v = band_stats(idx, right_e)
 
-    left_sum = cumsum[left_end] - cumsum[left_start]
-    right_sum = cumsum[right_end] - cumsum[right_start]
-    left_mean = left_sum / left_width[:, None]
-    right_mean = right_sum / right_width[:, None]
+    dissim = (
+        np.mean(np.abs(l_mean - r_mean), axis=1)
+        + 0.6 * np.sqrt(np.abs(l_v - r_v))
+    )
+    dis_thr = max(18.0, np.percentile(dissim, 78))
 
-    left_mean_gray = (cumsum_gray[left_end] - cumsum_gray[left_start]) / left_width
-    right_mean_gray = (cumsum_gray[right_end] - cumsum_gray[right_start]) / right_width
+    # align all signals
+    d = dissim
+    c = continuity[idx]
+    s = seam_align[idx]
+    st = strong_align[idx]
 
-    left_sq_mean = (cumsum_sq[left_end] - cumsum_sq[left_start]) / left_width
-    right_sq_mean = (cumsum_sq[right_end] - cumsum_sq[right_start]) / right_width
-
-    left_var = np.clip(left_sq_mean - left_mean_gray ** 2, 0.0, None)
-    right_var = np.clip(right_sq_mean - right_mean_gray ** 2, 0.0, None)
-
-    mean_diff = np.mean(np.abs(left_mean - right_mean), axis=1)
-    var_diff = np.abs(left_var - right_var)
-    dissimilarity = mean_diff + 0.6 * np.sqrt(var_diff)
-
-    dissimilarity_thr = max(18.0, float(np.percentile(dissimilarity, 78)))
-
-    dissimilarity_gate = dissimilarity >= dissimilarity_thr
-    continuity_gate = continuity >= 0.60
-    alignment_gate = seam_alignment >= 0.35
-    strong_gate = strong_alignment <= 0.22
-
-    candidate = (
-        dissimilarity_gate &
-        continuity_gate &
-        alignment_gate &
-        strong_gate
+    valid = (
+        (d >= dis_thr) &
+        (c >= 0.60) &
+        (s >= 0.35) &
+        (st <= 0.22)
     )
 
-    candidate &= np.isin(idx, candidate_idx)
-    if not np.any(candidate):
+    if not np.any(valid):
         return None
-
-    dissimilarity_strength = np.clip((dissimilarity - dissimilarity_thr) / (dissimilarity_thr + 25.0), 0.0, 1.0)
-    continuity_strength = np.clip((continuity - 0.60) / 0.35, 0.0, 1.0)
-    alignment_strength = np.clip((seam_alignment - 0.35) / 0.30, 0.0, 1.0)
-
-    center_bias = 1.0 - np.abs(idx - Ws / 2) / (Ws / 2)
-    center_bias = np.clip(center_bias, 0.0, 1.0)
-
-    strong_penalty = np.clip(1.0 - strong_alignment / 0.25, 0.0, 1.0)
 
     score = (
-        0.50 * dissimilarity_strength +
-        0.25 * continuity_strength +
-        0.15 * alignment_strength +
-        0.10 * center_bias
+        0.5 * np.clip((d - dis_thr) / (dis_thr + 25), 0, 1) +
+        0.3 * np.clip((c - 0.6) / 0.4, 0, 1) +
+        0.2 * np.clip((s - 0.35) / 0.3, 0, 1)
     )
-    score *= strong_penalty
-    score *= candidate
+    score *= valid
 
-    split = int(np.argmax(score))
-    confidence = float(score[split])
+    best = np.argmax(score)
+    split = int(idx[best])
+    confidence = float(score[best])
 
     if confidence < 0.15:
         return None
@@ -218,57 +178,92 @@ def find_vertical_boundary(gray_s, color_s, bgmask):
     return split, confidence
 
 
-# ----------------------------
-# splitting
-# ----------------------------
+# ============================================================
+# Axis-aware split
+# ============================================================
 
-def split_postcards(img):
+def split_once(img, axis):
     color = np.array(img.convert("RGB"))
     gray = np.array(img.convert("L"))
+
+    if axis == "horizontal":
+        color = color.transpose(1, 0, 2)
+        gray = gray.T
 
     color_s = color[::2, ::2]
     gray_s = gray[::2, ::2]
 
-    bg_mode, border = classify_background(gray_s)
-    _, _, bgmask, _ = build_bg_and_depth(gray_s, bg_mode, border)
+    bgmask = build_bgmask(gray_s)
+    result = find_boundary(gray_s, color_s, bgmask)
 
-    result = find_vertical_boundary(gray_s, color_s, bgmask)
     if not result:
-        print("[Split] no-split (no proven vertical boundary)")
         return [img.copy()]
 
-    x_s, conf = result
-    scale_x = gray.shape[1] / gray_s.shape[1]
-    x = int(round(x_s * scale_x))
+    split_s, conf = result
+    scale = gray.shape[1] / gray_s.shape[1]
+    split = int(round(split_s * scale))
+
     H, W = gray.shape
-
     overlap = max(16, int(0.01 * W))
-    left = img.crop((0, 0, min(W, x + overlap), H))
-    right = img.crop((max(0, x - overlap), 0, W, H))
 
-    print(f"[Split] split x={x} conf={conf:.3f}")
-    return [left.copy(), right.copy()]
+    if axis == "horizontal":
+        top = img.crop((0, 0, img.width, split + overlap))
+        bot = img.crop((0, max(0, split - overlap), img.width, img.height))
+        return [top, bot]
+
+    left = img.crop((0, 0, split + overlap, img.height))
+    right = img.crop((max(0, split - overlap), 0, img.width, img.height))
+    return [left, right]
 
 
-# ----------------------------
-# main
-# ----------------------------
+# ============================================================
+# Main
+# ============================================================
 
 def main():
-    if len(sys.argv) != 2:
-        print("Usage: python postcard_split.py <image>")
+    if len(sys.argv) < 2:
+        print("Usage: python postcard_split.py <scan1> <scan2> ...")
         sys.exit(1)
 
-    img = Image.open(sys.argv[1])
-    out = Path("output")
-    out.mkdir(exist_ok=True)
+    out_root = Path("output")
+    out_root.mkdir(exist_ok=True)
 
-    parts = split_postcards(img)
+    scans = [Path(p) for p in sys.argv[1:]]
 
-    for idx, postcard in enumerate(parts, start=1):
-        postcard.save(out / f"postcard_{idx}.jpg", quality=95)
+    BACK_MIRROR_MAP = {1: 2, 2: 1, 3: 4, 4: 3}
 
-    print("Saved outputs.")
+    for scan_idx, scan_path in enumerate(scans):
+        img = Image.open(scan_path)
+
+        # Determine role purely by sequence
+        is_front = (scan_idx % 2 == 0)
+        pair_id = scan_idx // 2 + 1
+
+        out_dir = out_root / f"pair_{pair_id:03d}"
+        out_dir.mkdir(exist_ok=True)
+
+        # ---- split (unchanged logic) ----
+        parts = []
+        for half in split_once(img, "horizontal"):
+            parts.extend(split_once(half, "vertical"))
+
+        if len(parts) != 4:
+            print(f"WARNING: {scan_path.name} produced {len(parts)} parts")
+
+        # ---- naming logic ----
+        for idx, p in enumerate(parts, 1):
+            if is_front:
+                fname = f"postcard_{idx}_front.jpg"
+            else:
+                paired_idx = BACK_MIRROR_MAP[idx]
+                fname = f"postcard_{paired_idx}_back.jpg"
+
+            p.save(out_dir / fname, quality=95)
+
+        role = "front" if is_front else "back"
+        print(f"[OK] {scan_path.name} → {role} (pair {pair_id})")
+
+    print("All scans processed.")
 
 
 if __name__ == "__main__":
