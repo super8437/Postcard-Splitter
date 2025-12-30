@@ -122,6 +122,50 @@ def build_bg_and_depth(gray_s, bg_mode, border_pixels):
     return mode, thr_return, bgmask, depth
 
 
+def compute_vertical_edges(gray_s):
+    smoothed = ndi.gaussian_filter(gray_s.astype(np.float32), sigma=1.0)
+    gx = ndi.sobel(smoothed, axis=1)
+    edge = np.abs(gx)
+    return ndi.gaussian_filter(edge, sigma=1.0)
+
+
+def score_vertical_white(gray_s, bgmask, white_t):
+    Hs, Ws = gray_s.shape
+    edge_map = compute_vertical_edges(gray_s)
+    col_edge = edge_map.mean(axis=0)
+    norm_edge = max(1e-3, float(np.percentile(col_edge, 95)))
+    edge_density = np.clip(col_edge / norm_edge, 0.0, 1.0)
+    edge_absence = 1.0 - edge_density
+
+    fg_density = np.mean(gray_s < white_t, axis=0)
+    bg_clear = 1.0 - fg_density
+
+    low_edge_mask = edge_map <= np.percentile(edge_map, 35)
+    stable_gap = np.mean(bgmask & low_edge_mask, axis=0)
+
+    center = np.linspace(-1.0, 1.0, Ws, dtype=np.float32)
+    center_bias = 1.0 - np.abs(center)
+    center_bias /= max(1e-6, center_bias.max())
+
+    score = 0.45 * bg_clear + 0.45 * edge_absence + 0.10 * center_bias
+    score *= 0.5 + 0.5 * stable_gap
+
+    column_bg = np.mean(bgmask, axis=0)
+    score *= column_bg >= 0.05
+
+    strong_edge = edge_density >= 0.65
+    dilate_px = max(3, int(0.01 * Ws))
+    no_cut = ndi.binary_dilation(strong_edge, iterations=dilate_px)
+    score[no_cut] = 0.0
+
+    return {
+        "score": score,
+        "edge_density": edge_density,
+        "stable_gap": stable_gap,
+        "no_cut": no_cut,
+    }
+
+
 def best_scored_run(scores, start_idx, min_len, center_penalty=0.5, threshold=0.20, axis_length=None):
     scores = np.asarray(scores, dtype=np.float32)
     thr = threshold
@@ -198,6 +242,43 @@ def find_split_from_depth(depth, axis):
             axis_length=Ws,
         )
         return run
+
+
+def find_vertical_split_white(gray_s, bgmask, thr_map, depth):
+    Ws = gray_s.shape[1]
+    metrics = score_vertical_white(gray_s, bgmask, thr_map["WHITE_T"])
+    scores = metrics["score"]
+    run = best_scored_run(
+        scores,
+        start_idx=0,
+        min_len=max(3, int(0.01 * Ws)),
+        center_penalty=0.2,
+        threshold=0.15,
+        axis_length=Ws,
+    )
+    if not run:
+        return None
+
+    split = run["split"]
+    edge_at_split = float(metrics["edge_density"][split])
+    stable_at_split = float(metrics["stable_gap"][split])
+    depth_at_split = float(np.mean(depth[:, split]))
+
+    confidence = (
+        float(run["mean"])
+        * float(run["length"]) / max(1.0, Ws)
+        * (1.0 - edge_at_split)
+        * (0.5 + 0.5 * stable_at_split)
+    )
+
+    return {
+        "split": split,
+        "run": run,
+        "edge_at_split": edge_at_split,
+        "stable_at_split": stable_at_split,
+        "depth_at_split": depth_at_split,
+        "confidence": confidence,
+    }
 
 
 # ----------------------------
@@ -281,30 +362,70 @@ def vertical_split(half_img, tag):
     gray_s = gray[::s, ::s]
 
     bg_mode, border = classify_background(gray_s)
-    mode, thr_map, _, depth = build_bg_and_depth(gray_s, bg_mode, border)
-    run = find_split_from_depth(depth, axis="vertical")
+    mode, thr_map, bgmask, depth = build_bg_and_depth(gray_s, bg_mode, border)
 
-    if run:
-        x_split_s = run["split"]
-        ok = sanity_check_vertical(gray_s, mode, thr_map, x_split_s)
+    info = {
+        "mode": mode,
+        "bg": bg_mode,
+        "thr": thr_map,
+        "confidence": None,
+        "decision": None,
+    }
 
-        if ok:
-            x_split = x_split_s * s
-            print(
-                f"[Step 2:{tag}] bg={bg_mode}, mode={mode}, score={run['mean']:.3f}, "
-                f"x_split={x_split}, thr={thr_map}"
-            )
+    if mode == "white":
+        result = find_vertical_split_white(gray_s, bgmask, thr_map, depth)
+        if result and result["confidence"] >= 0.05:
+            x_split_s = result["split"]
+            ok = sanity_check_vertical(gray_s, mode, thr_map, x_split_s)
+            if ok:
+                x_split = x_split_s * s
+                info.update(
+                    {
+                        "confidence": result["confidence"],
+                        "edge_at_split": result["edge_at_split"],
+                        "stable": result["stable_at_split"],
+                        "decision": "edge+bg",
+                    }
+                )
+                print(
+                    f"[Step 2:{tag}] bg={bg_mode}, mode={mode}, score={result['run']['mean']:.3f}, "
+                    f"conf={result['confidence']:.3f}, x_split={x_split}, thr={thr_map}"
+                )
+            else:
+                x_split = None
+                info["decision"] = "sanity_reject"
+        else:
+            x_split = None
+            info["decision"] = "low_confidence"
+    else:
+        run = find_split_from_depth(depth, axis="vertical")
+        if run:
+            x_split_s = run["split"]
+            ok = sanity_check_vertical(gray_s, mode, thr_map, x_split_s)
+            if ok:
+                x_split = x_split_s * s
+                info.update({"decision": "depth", "confidence": run["mean"]})
+                print(
+                    f"[Step 2:{tag}] bg={bg_mode}, mode={mode}, score={run['mean']:.3f}, "
+                    f"x_split={x_split}, thr={thr_map}"
+                )
+            else:
+                x_split = W // 2
+                info["decision"] = "fallback_sanity"
+                print(f"[Step 2:{tag}] bg={bg_mode}, mode=fallback(sanity), x_split={x_split}")
         else:
             x_split = W // 2
-            print(f"[Step 2:{tag}] bg={bg_mode}, mode=fallback(sanity), x_split={x_split}")
-    else:
-        x_split = W // 2
-        print(f"[Step 2:{tag}] bg={bg_mode}, mode=fallback(none), x_split={x_split}")
+            info["decision"] = "fallback_none"
+            print(f"[Step 2:{tag}] bg={bg_mode}, mode=fallback(none), x_split={x_split}")
+
+    if x_split is None:
+        print(f"[Step 2:{tag}] decision=no-split ({info['decision']}); returning original image.")
+        return half_img.copy(), half_img.copy(), info
 
     overlap = max(20, int(0.01 * W))
     left = half_img.crop((0, 0, min(W, x_split + overlap), H))
     right = half_img.crop((max(0, x_split - overlap), 0, W, H))
-    return left, right
+    return left, right, info
 
 
 # ----------------------------
@@ -323,8 +444,8 @@ def main():
     out = Path("output")
     out.mkdir(exist_ok=True)
 
-    tl, tr = vertical_split(top, "top")
-    bl, br = vertical_split(bottom, "bottom")
+    tl, tr, _top_info = vertical_split(top, "top")
+    bl, br, _bottom_info = vertical_split(bottom, "bottom")
 
     tl.save(out / "postcard_1.jpg", quality=95)
     tr.save(out / "postcard_2.jpg", quality=95)
