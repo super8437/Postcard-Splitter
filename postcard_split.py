@@ -2,40 +2,8 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import scipy.ndimage as ndi
 from PIL import Image
-
-
-# ----------------------------
-# helpers
-# ----------------------------
-
-def best_run(mask, min_len):
-    runs = []
-    start = None
-    for i, v in enumerate(mask):
-        if v and start is None:
-            start = i
-        elif not v and start is not None:
-            if i - start >= min_len:
-                runs.append((start, i - 1))
-            start = None
-    if start is not None and len(mask) - start >= min_len:
-        runs.append((start, len(mask) - 1))
-    if not runs:
-        return None
-
-    center = len(mask) / 2
-    # prefer longer runs; tie-break toward center
-    runs.sort(key=lambda r: ((r[1] - r[0]), -abs(((r[0] + r[1]) / 2) - center)), reverse=True)
-    return runs[0]
-
-
-def smooth_1d(x, k=7):
-    k = max(3, int(k))
-    if k % 2 == 0:
-        k += 1
-    w = np.ones(k, dtype=np.float32) / k
-    return np.convolve(x, w, mode="same")
 
 
 def classify_background(gray_s):
@@ -72,126 +40,164 @@ def classify_background(gray_s):
 def thresholds_from_border(bg_mode, border_pixels):
     if bg_mode == "white":
         # border in white sleeves is very bright; use a lower quantile to tolerate texture
-        WHITE_T = max(200, int(np.percentile(border_pixels, 25) - 5))
-        return {"WHITE_T": WHITE_T}
+        white_t = max(200, int(np.percentile(border_pixels, 25) - 5))
+        return {"WHITE_T": white_t}
     if bg_mode == "black":
         # border in black sleeves is dark but can have glare; use mid quantile and clamp
-        BLACK_T = int(np.percentile(border_pixels, 60) + 10)
-        BLACK_T = int(np.clip(BLACK_T, 25, 150))
-        return {"BLACK_T": BLACK_T}
+        black_t = int(np.percentile(border_pixels, 60) + 10)
+        black_t = int(np.clip(black_t, 25, 150))
+        return {"BLACK_T": black_t}
     # unknown: provide both, derived from border anyway
-    WHITE_T = max(200, int(np.percentile(border_pixels, 35) - 5))
-    BLACK_T = int(np.clip(int(np.percentile(border_pixels, 50) + 10), 25, 150))
-    return {"WHITE_T": WHITE_T, "BLACK_T": BLACK_T}
+    white_t = max(200, int(np.percentile(border_pixels, 35) - 5))
+    black_t = int(np.clip(int(np.percentile(border_pixels, 50) + 10), 25, 150))
+    return {"WHITE_T": white_t, "BLACK_T": black_t}
+
+
+def connected_bg_mask(gray_s, mode, thr_value):
+    if mode == "white":
+        cand = gray_s >= thr_value
+        border_value = True
+    else:
+        cand = gray_s <= thr_value
+        border_value = True
+
+    cand = ndi.binary_closing(cand, structure=np.ones((5, 5), dtype=bool), border_value=border_value)
+    labels, _ = ndi.label(cand)
+    border_labels = np.unique(
+        np.concatenate([labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1]])
+    )
+    border_labels = border_labels[border_labels != 0]
+    bg = np.isin(labels, border_labels)
+    return bg
+
+
+def build_bg_and_depth(gray_s, bg_mode, border_pixels):
+    thr_map = thresholds_from_border(bg_mode, border_pixels)
+    modes = []
+    if bg_mode == "white":
+        modes = ["white"]
+    elif bg_mode == "black":
+        modes = ["black"]
+    else:
+        modes = ["white", "black"]
+
+    best = None
+    for mode in modes:
+        key = "WHITE_T" if mode == "white" else "BLACK_T"
+        if key not in thr_map:
+            continue
+        thr_val = thr_map[key]
+
+        def attempt(thr):
+            bg = connected_bg_mask(gray_s, mode, thr)
+            cover = float(bg.mean())
+            # if coverage is tiny, relax threshold (white: lower; black: higher)
+            if cover < 0.01:
+                adj = -10 if mode == "white" else 10
+                bg2 = connected_bg_mask(gray_s, mode, thr + adj)
+                if float(bg2.mean()) > cover:
+                    return bg2
+            # if coverage is huge, tighten threshold
+            if cover > 0.90:
+                adj = 10 if mode == "white" else -10
+                bg2 = connected_bg_mask(gray_s, mode, thr + adj)
+                if 0.05 < float(bg2.mean()) < cover:
+                    return bg2
+            return bg
+
+        bgmask = attempt(thr_val)
+        depth = ndi.distance_transform_edt(bgmask.astype(np.uint8))
+        score = float(np.percentile(depth, 90)) * float(bgmask.mean() + 1e-3)
+        if best is None or score > best[0]:
+            best = (score, mode, thr_val, bgmask, depth)
+
+    if best is None:
+        empty = np.zeros_like(gray_s, dtype=bool)
+        return "unknown", {"WHITE_T": 230}, empty, np.zeros_like(gray_s, dtype=np.float32)
+
+    _, mode, thr_val, bgmask, depth = best
+    thr_return = {"WHITE_T": thr_val} if mode == "white" else {"BLACK_T": thr_val}
+    return mode, thr_return, bgmask, depth
+
+
+def best_scored_run(scores, start_idx, min_len, center_penalty=0.5, threshold=0.20):
+    scores = np.asarray(scores, dtype=np.float32)
+    thr = threshold
+    ok = scores >= thr
+    if not np.any(ok):
+        thr = max(0.10, threshold - 0.05)
+        ok = scores >= thr
+    if not np.any(ok):
+        return None
+
+    idx = np.flatnonzero(ok)
+    runs = []
+    a = b = idx[0]
+    for i in idx[1:]:
+        if i == b + 1:
+            b = i
+        else:
+            runs.append((a, b))
+            a = b = i
+    runs.append((a, b))
+
+    best = None
+    for a, b in runs:
+        length = b - a + 1
+        if length < min_len:
+            continue
+        mean = float(scores[a : b + 1].mean())
+        mid = (a + b) / 2.0
+        quality = length * mean
+        final = quality / (1.0 + center_penalty * abs((start_idx + mid) - (start_idx + len(scores) / 2)) / len(scores))
+        cand = (final, mean, length, mid)
+        if best is None or cand > best:
+            best = cand
+    if best is None:
+        return None
+
+    _, mean, length, mid = best
+    split = int(round(start_idx + mid))
+    return {"split": split, "mean": mean, "length": length}
+
+
+def find_split_from_depth(depth, axis):
+    Hs, Ws = depth.shape
+    D = 2  # depth floor on downsampled grid
+    if axis == "horizontal":
+        # y-search band and x-exclusion per instructions
+        y0, y1 = int(0.30 * Hs), int(0.70 * Hs)
+        x0, x1 = int(0.10 * Ws), int(0.90 * Ws)
+        cx0, cx1 = int(0.45 * Ws), int(0.55 * Ws)
+        xs = np.r_[np.arange(x0, cx0), np.arange(cx1, x1)]
+        band = depth[y0:y1, :][:, xs]
+        row_score = np.mean(band >= D, axis=1)
+        run = best_scored_run(row_score, start_idx=y0, min_len=max(3, int(0.01 * Hs)))
+        return run
+    else:
+        # vertical split: focus near center width but allow moderate drift
+        x0, x1 = int(0.20 * Ws), int(0.80 * Ws)
+        y0, y1 = int(0.10 * Hs), int(0.90 * Hs)
+        band = depth[y0:y1, x0:x1]
+        col_score = np.mean(band >= D, axis=0)
+        run = best_scored_run(col_score, start_idx=x0, min_len=max(3, int(0.01 * Ws)))
+        return run
 
 
 # ----------------------------
-# stripe detectors
+# sanity checks
 # ----------------------------
-
-def find_horizontal_split(gray_s, bg_mode, border_pixels):
-    Hs, Ws = gray_s.shape
-    thr = thresholds_from_border(bg_mode, border_pixels)
-
-    # use central width so left/right borders don't dominate
-    cx0, cx1 = int(0.20 * Ws), int(0.80 * Ws)
-
-    # only search for a split near the middle of the image
-    sy0, sy1 = int(0.25 * Hs), int(0.75 * Hs)
-
-    candidates = []
-
-    if bg_mode in ("white", "unknown") and "WHITE_T" in thr:
-        WHITE_T = thr["WHITE_T"]
-        row_bg = np.mean(gray_s[:, cx0:cx1] >= WHITE_T, axis=1)
-        row_bg_s = smooth_1d(row_bg, k=max(7, int(0.02 * Hs)))
-
-        # white sleeves: background stripe should be very strong
-        good = row_bg_s >= 0.92
-        run = best_run(good[sy0:sy1], min_len=max(3, int(0.01 * Hs)))
-        if run:
-            r0, r1 = run
-            y_split_s = sy0 + (r0 + r1) // 2
-            score = float(np.mean(row_bg_s[y_split_s - 2:y_split_s + 3]))
-            candidates.append(("white", score, y_split_s, thr))
-
-    if bg_mode in ("black", "unknown") and "BLACK_T" in thr:
-        BLACK_T = thr["BLACK_T"]
-        row_bg = np.mean(gray_s[:, cx0:cx1] <= BLACK_T, axis=1)
-        row_bg_s = smooth_1d(row_bg, k=max(7, int(0.02 * Hs)))
-
-        # black sleeves: allow more texture/glare
-        good = row_bg_s >= 0.80
-        run = best_run(good[sy0:sy1], min_len=max(3, int(0.01 * Hs)))
-        if run:
-            r0, r1 = run
-            y_split_s = sy0 + (r0 + r1) // 2
-            score = float(np.mean(row_bg_s[y_split_s - 2:y_split_s + 3]))
-            candidates.append(("black", score, y_split_s, thr))
-
-    if not candidates:
-        return None
-
-    # choose best score
-    candidates.sort(key=lambda x: x[1], reverse=True)
-    return candidates[0]  # (mode, score, y_split_s, thr)
-
-
-def find_vertical_split(gray_s, bg_mode, border_pixels):
-    Hs, Ws = gray_s.shape
-    thr = thresholds_from_border(bg_mode, border_pixels)
-
-    # use central height so top/bottom margins don't dominate
-    ry0, ry1 = int(0.20 * Hs), int(0.80 * Hs)
-
-    # only search near center width
-    sx0, sx1 = int(0.25 * Ws), int(0.75 * Ws)
-
-    candidates = []
-
-    if bg_mode in ("white", "unknown") and "WHITE_T" in thr:
-        WHITE_T = thr["WHITE_T"]
-        col_bg = np.mean(gray_s[ry0:ry1, :] >= WHITE_T, axis=0)
-        col_bg_s = smooth_1d(col_bg, k=max(7, int(0.02 * Ws)))
-
-        good = col_bg_s >= 0.92
-        run = best_run(good[sx0:sx1], min_len=max(3, int(0.01 * Ws)))
-        if run:
-            r0, r1 = run
-            x_split_s = sx0 + (r0 + r1) // 2
-            score = float(np.mean(col_bg_s[x_split_s - 2:x_split_s + 3]))
-            candidates.append(("white", score, x_split_s, thr))
-
-    if bg_mode in ("black", "unknown") and "BLACK_T" in thr:
-        BLACK_T = thr["BLACK_T"]
-        col_bg = np.mean(gray_s[ry0:ry1, :] <= BLACK_T, axis=0)
-        col_bg_s = smooth_1d(col_bg, k=max(7, int(0.02 * Ws)))
-
-        good = col_bg_s >= 0.80
-        run = best_run(good[sx0:sx1], min_len=max(3, int(0.01 * Ws)))
-        if run:
-            r0, r1 = run
-            x_split_s = sx0 + (r0 + r1) // 2
-            score = float(np.mean(col_bg_s[x_split_s - 2:x_split_s + 3]))
-            candidates.append(("black", score, x_split_s, thr))
-
-    if not candidates:
-        return None
-
-    candidates.sort(key=lambda x: x[1], reverse=True)
-    return candidates[0]
-
 
 def sanity_check_horizontal(gray_s, mode, thr, y_split_s):
     Hs, Ws = gray_s.shape
     cx0, cx1 = int(0.20 * Ws), int(0.80 * Ws)
 
     if mode == "white":
-        WHITE_T = thr["WHITE_T"]
-        bg = gray_s[:, cx0:cx1] >= WHITE_T
+        white_t = thr["WHITE_T"]
+        bg = gray_s[:, cx0:cx1] >= white_t
     else:
-        BLACK_T = thr["BLACK_T"]
-        bg = gray_s[:, cx0:cx1] <= BLACK_T
+        black_t = thr["BLACK_T"]
+        bg = gray_s[:, cx0:cx1] <= black_t
 
     top_fg = 1.0 - float(np.mean(bg[:y_split_s, :]))
     bot_fg = 1.0 - float(np.mean(bg[y_split_s:, :]))
@@ -203,11 +209,11 @@ def sanity_check_vertical(gray_s, mode, thr, x_split_s):
     ry0, ry1 = int(0.20 * Hs), int(0.80 * Hs)
 
     if mode == "white":
-        WHITE_T = thr["WHITE_T"]
-        bg = gray_s[ry0:ry1, :] >= WHITE_T
+        white_t = thr["WHITE_T"]
+        bg = gray_s[ry0:ry1, :] >= white_t
     else:
-        BLACK_T = thr["BLACK_T"]
-        bg = gray_s[ry0:ry1, :] <= BLACK_T
+        black_t = thr["BLACK_T"]
+        bg = gray_s[ry0:ry1, :] <= black_t
 
     left_fg = 1.0 - float(np.mean(bg[:, :x_split_s]))
     right_fg = 1.0 - float(np.mean(bg[:, x_split_s:]))
@@ -222,19 +228,22 @@ def horizontal_split(img):
     gray = np.array(img.convert("L"))
     H, W = gray.shape
 
-    s = 2
+    s = 2  # integer stride for downsample
     gray_s = gray[::s, ::s]
 
     bg_mode, border = classify_background(gray_s)
-    candidate = find_horizontal_split(gray_s, bg_mode, border)
+    mode, thr_map, _, depth = build_bg_and_depth(gray_s, bg_mode, border)
+    run = find_split_from_depth(depth, axis="horizontal")
 
-    if candidate:
-        mode, score, y_split_s, thr = candidate
-        ok = sanity_check_horizontal(gray_s, mode, thr, y_split_s)
-
+    if run:
+        y_split_s = run["split"]
+        ok = sanity_check_horizontal(gray_s, mode, thr_map, y_split_s)
         if ok:
             y_split = y_split_s * s
-            print(f"[Step 1] bg={bg_mode}, mode={mode}, score={score:.3f}, y_split={y_split}")
+            print(
+                f"[Step 1] bg={bg_mode}, mode={mode}, score={run['mean']:.3f}, "
+                f"y_split={y_split}, thr={thr_map}"
+            )
         else:
             y_split = H // 2
             print(f"[Step 1] bg={bg_mode}, mode=fallback(sanity), y_split={y_split}")
@@ -252,19 +261,23 @@ def vertical_split(half_img, tag):
     gray = np.array(half_img.convert("L"))
     H, W = gray.shape
 
-    s = 2
+    s = 2  # integer stride for downsample
     gray_s = gray[::s, ::s]
 
     bg_mode, border = classify_background(gray_s)
-    candidate = find_vertical_split(gray_s, bg_mode, border)
+    mode, thr_map, _, depth = build_bg_and_depth(gray_s, bg_mode, border)
+    run = find_split_from_depth(depth, axis="vertical")
 
-    if candidate:
-        mode, score, x_split_s, thr = candidate
-        ok = sanity_check_vertical(gray_s, mode, thr, x_split_s)
+    if run:
+        x_split_s = run["split"]
+        ok = sanity_check_vertical(gray_s, mode, thr_map, x_split_s)
 
         if ok:
             x_split = x_split_s * s
-            print(f"[Step 2:{tag}] bg={bg_mode}, mode={mode}, score={score:.3f}, x_split={x_split}")
+            print(
+                f"[Step 2:{tag}] bg={bg_mode}, mode={mode}, score={run['mean']:.3f}, "
+                f"x_split={x_split}, thr={thr_map}"
+            )
         else:
             x_split = W // 2
             print(f"[Step 2:{tag}] bg={bg_mode}, mode=fallback(sanity), x_split={x_split}")
