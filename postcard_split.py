@@ -103,74 +103,98 @@ def vertical_edge_map(gray_s):
     return ndi.gaussian_filter(np.abs(gx), 1.0)
 
 
-def find_vertical_split_white(gray_s, bgmask, white_t, depth):
+def find_vertical_boundary(gray_s, color_s, bgmask):
     Hs, Ws = gray_s.shape
-
-    edge = vertical_edge_map(gray_s)
-    col_edge = edge.mean(axis=0)
-    col_mean = gray_s.mean(axis=0)
-
-    norm = max(1e-3, np.percentile(col_edge, 90))
-    edge_density = np.clip(col_edge / norm, 0, 1)
-    edge_absence = 1.0 - edge_density
-
-    fg_density = np.mean(gray_s < white_t, axis=0)
-    bg_clear = 1.0 - fg_density
-
-    low_edge = edge <= np.percentile(edge, 35)
-    stable_gap = np.mean(bgmask & low_edge, axis=0)
-
-    band = max(3, int(0.01 * Ws))
-    idx = np.arange(Ws)
-    col_cumsum = np.concatenate([[0.0], np.cumsum(col_mean)])
-
-    left_start = np.maximum(0, idx - band)
-    left_end = idx
-    left_sum = col_cumsum[left_end + 1] - col_cumsum[left_start]
-    left_width = np.maximum(1, left_end - left_start)
-    left_mean = left_sum / left_width
-
-    right_start = idx
-    right_end = np.minimum(Ws, idx + band)
-    right_sum = col_cumsum[right_end] - col_cumsum[right_start]
-    right_width = np.maximum(1, right_end - right_start)
-    right_mean = right_sum / right_width
-
-    contrast = np.abs(left_mean - right_mean)
-    contrast_thr = 10.0
-    contrast_gate = contrast >= contrast_thr
-    contrast_norm = np.clip((contrast - contrast_thr) / max(1.0, contrast_thr), 0, 1)
-
-    continuity = np.mean(bgmask, axis=0)
-    continuity_gate = continuity >= 0.25
-
-    center = np.linspace(-1, 1, Ws)
-    center_bias = 1.0 - np.abs(center)
-
-    score = (
-        0.45 * bg_clear +
-        0.45 * edge_absence +
-        0.10 * center_bias
-    )
-    score *= (0.5 + 0.5 * contrast_norm)
-    score *= (0.5 + 0.5 * stable_gap)
-    score *= contrast_gate & continuity_gate
-
-    strong_edge = edge_density >= 0.6
-    dilate = max(2, int(0.006 * Ws))
-    no_cut = ndi.binary_dilation(strong_edge, iterations=dilate)
-    score[no_cut] = 0.0
-
-    idx = np.where(score >= 0.15)[0]
-    if idx.size == 0:
+    band_top = max(0, int(0.15 * Hs))
+    band_bot = min(Hs, int(0.85 * Hs))
+    if band_bot - band_top < 10:
         return None
 
-    split = int(idx[np.argmax(score[idx])])
-    confidence = (
-        float(score[split]) *
-        (1.0 - edge_density[split]) *
-        (0.5 + 0.5 * stable_gap[split])
-    )
+    band_slice = slice(band_top, band_bot)
+    band_gray = gray_s[band_slice].astype(np.float32)
+    band_color = color_s[band_slice].astype(np.float32)
+
+    edge = vertical_edge_map(gray_s)
+    edge_band = edge[band_slice]
+
+    weak_thr = float(np.percentile(edge_band, 55))
+    strong_thr = float(np.percentile(edge_band, 92))
+
+    seam_mask = (edge_band >= weak_thr) & (edge_band <= strong_thr)
+    strong_mask = edge_band >= strong_thr
+
+    seam_alignment = seam_mask.mean(axis=0)
+    strong_alignment = strong_mask.mean(axis=0)
+
+    bg_band = bgmask[band_slice]
+    continuity = np.mean(bg_band | seam_mask, axis=0)
+
+    # left-right dissimilarity using RGB means + gray variance
+    col_mean = band_color.mean(axis=0)  # (W, 3)
+    col_mean_gray = band_gray.mean(axis=0)
+    col_sq_mean = (band_gray ** 2).mean(axis=0)
+
+    cumsum = np.concatenate([np.zeros((1, 3)), np.cumsum(col_mean, axis=0)], axis=0)
+    cumsum_gray = np.concatenate([[0.0], np.cumsum(col_mean_gray)])
+    cumsum_sq = np.concatenate([[0.0], np.cumsum(col_sq_mean)])
+
+    band_w = max(4, int(0.03 * Ws))
+    idx = np.arange(Ws)
+
+    left_start = np.clip(idx - band_w, 0, Ws)
+    left_end = idx
+    left_width = np.maximum(1, left_end - left_start)
+
+    right_start = np.clip(idx + 1, 0, Ws)
+    right_end = np.clip(idx + band_w + 1, 0, Ws)
+    right_width = np.maximum(1, right_end - right_start)
+
+    left_sum = cumsum[left_end] - cumsum[left_start]
+    right_sum = cumsum[right_end] - cumsum[right_start]
+    left_mean = left_sum / left_width[:, None]
+    right_mean = right_sum / right_width[:, None]
+
+    left_mean_gray = (cumsum_gray[left_end] - cumsum_gray[left_start]) / left_width
+    right_mean_gray = (cumsum_gray[right_end] - cumsum_gray[right_start]) / right_width
+
+    left_sq_mean = (cumsum_sq[left_end] - cumsum_sq[left_start]) / left_width
+    right_sq_mean = (cumsum_sq[right_end] - cumsum_sq[right_start]) / right_width
+
+    left_var = np.clip(left_sq_mean - left_mean_gray ** 2, 0.0, None)
+    right_var = np.clip(right_sq_mean - right_mean_gray ** 2, 0.0, None)
+
+    mean_diff = np.mean(np.abs(left_mean - right_mean), axis=1)
+    var_diff = np.abs(left_var - right_var)
+    dissimilarity = mean_diff + 0.5 * np.sqrt(var_diff)
+
+    dissimilarity_thr = max(12.0, float(np.percentile(dissimilarity, 70)))
+    dissimilarity_gate = dissimilarity >= dissimilarity_thr
+
+    continuity_gate = continuity >= 0.70
+    alignment_gate = seam_alignment >= 0.45
+    strong_gate = strong_alignment <= 0.20
+
+    candidate = dissimilarity_gate & continuity_gate & alignment_gate & strong_gate
+    if not np.any(candidate):
+        return None
+
+    dissimilarity_strength = np.clip((dissimilarity - dissimilarity_thr) / (dissimilarity_thr + 20.0), 0.0, 1.0)
+    continuity_strength = np.clip((continuity - 0.70) / 0.30, 0.0, 1.0)
+    alignment_strength = np.clip((seam_alignment - 0.45) / 0.35, 0.0, 1.0)
+    strong_penalty = np.clip(1.0 - strong_alignment / 0.25, 0.0, 1.0)
+
+    score = (
+        0.45 * dissimilarity_strength +
+        0.30 * continuity_strength +
+        0.25 * alignment_strength
+    ) * strong_penalty
+
+    score *= candidate
+    split = int(np.argmax(score))
+    confidence = float(score[split])
+
+    if confidence <= 0.0:
+        return None
 
     return split, confidence
 
@@ -184,8 +208,7 @@ def horizontal_split(img):
     H, W = gray.shape
     gray_s = gray[::2, ::2]
 
-    bg_mode, border = classify_background(gray_s)
-    mode, thr, bgmask, depth = build_bg_and_depth(gray_s, bg_mode, border)
+    bg_mode, _ = classify_background(gray_s)
 
     y = H // 2
     print(f"[Step 1] bg={bg_mode}, y_split={y}")
@@ -193,34 +216,28 @@ def horizontal_split(img):
 
 
 def vertical_split(half_img, tag):
+    color = np.array(half_img.convert("RGB"))
     gray = np.array(half_img.convert("L"))
     H, W = gray.shape
+    color_s = color[::2, ::2]
     gray_s = gray[::2, ::2]
 
     bg_mode, border = classify_background(gray_s)
-    mode, thr, bgmask, depth = build_bg_and_depth(gray_s, bg_mode, border)
+    _, _, bgmask, _ = build_bg_and_depth(gray_s, bg_mode, border)
 
-    if mode == "white":
-        result = find_vertical_split_white(gray_s, bgmask, thr["WHITE_T"], depth)
-        if not result:
-            print(f"[Step 2:{tag}] no-split (low confidence)")
-            return half_img.copy(), half_img.copy()
+    result = find_vertical_boundary(gray_s, color_s, bgmask)
+    if not result:
+        print(f"[Step 2:{tag}] no-split (no proven boundary)")
+        return [half_img.copy()]
 
-        x_s, conf = result
-        if conf < 0.07:
-            print(f"[Step 2:{tag}] no-split (conf={conf:.3f})")
-            return half_img.copy(), half_img.copy()
-
-        x = x_s * 2
-        print(f"[Step 2:{tag}] white split x={x} conf={conf:.3f}")
-    else:
-        x = W // 2
-        print(f"[Step 2:{tag}] black fallback split x={x}")
+    x_s, conf = result
+    x = int(x_s * 2)
+    print(f"[Step 2:{tag}] split x={x} conf={conf:.3f}")
 
     overlap = max(20, int(0.01 * W))
     left = half_img.crop((0, 0, min(W, x + overlap), H))
     right = half_img.crop((max(0, x - overlap), 0, W, H))
-    return left, right
+    return [left.copy(), right.copy()]
 
 
 # ----------------------------
@@ -237,13 +254,12 @@ def main():
     out.mkdir(exist_ok=True)
 
     top, bottom = horizontal_split(img)
-    tl, tr = vertical_split(top, "top")
-    bl, br = vertical_split(bottom, "bottom")
+    parts = []
+    parts.extend(vertical_split(top, "top"))
+    parts.extend(vertical_split(bottom, "bottom"))
 
-    tl.save(out / "postcard_1.jpg", quality=95)
-    tr.save(out / "postcard_2.jpg", quality=95)
-    bl.save(out / "postcard_3.jpg", quality=95)
-    br.save(out / "postcard_4.jpg", quality=95)
+    for idx, postcard in enumerate(parts, start=1):
+        postcard.save(out / f"postcard_{idx}.jpg", quality=95)
 
     print("Saved outputs.")
 
