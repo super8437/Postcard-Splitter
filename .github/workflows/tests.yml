@@ -12,10 +12,18 @@ jobs:
         with:
           python-version: "3.11"
 
-      - run: pip install -r requirements.txt
-      - run: pip install pytest
+      - name: Install dependencies + package (same interpreter)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pytest
+          python -m pip install -e .
 
-      # 🔑 THIS IS THE FIX
-      - run: pip install -e .
+      - name: Sanity check imports
+        run: |
+          python -c "import sys; print('python:', sys.executable)"
+          python -c "import PIL; import numpy; import scipy; print('deps ok')"
 
-      - run: pytest
+      - name: Run tests
+        run: |
+          python -m pytest -q
