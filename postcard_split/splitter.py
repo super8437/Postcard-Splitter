@@ -1,7 +1,8 @@
 import argparse
+import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Tuple
 
 import numpy as np
 import scipy.ndimage as ndi
@@ -30,6 +31,13 @@ class SplitContext:
 
 
 DEBUG_SEAMS = False  # set by CLI
+
+
+@dataclass
+class SeamResult:
+    position: int
+    confidence: float
+    stage: str
 
 
 # ============================================================
@@ -136,7 +144,7 @@ def connected_bg_mask(gray_s, mode, thr):
     else:
         cand = gray_s <= thr
 
-    cand = ndi.binary_closing(cand, structure=np.ones((5, 5)), border_value=False)
+    cand = ndi.binary_closing(cand, structure=np.ones((5, 5)), border_value=True)
     labels, _ = ndi.label(cand)
 
     border_labels = np.unique(np.concatenate([
@@ -151,8 +159,15 @@ def build_bgmask(gray_s):
     bg_mode, border = classify_background(gray_s)
     thr_map = thresholds_from_border(bg_mode, border)
 
-    mode = bg_mode if bg_mode in ("white", "black") else "white"
-    thr = thr_map.get("WHITE_T", 230)
+    if bg_mode in ("white", "black"):
+        mode = bg_mode
+    else:
+        frac_white = float(np.mean(border >= 230))
+        frac_black = float(np.mean(border <= 60))
+        mode = "black" if frac_black >= frac_white else "white"
+
+    thr_key = "WHITE_T" if mode == "white" else "BLACK_T"
+    thr = thr_map.get(thr_key, 230 if mode == "white" else 80)
 
     return connected_bg_mask(gray_s, mode, thr)
 
@@ -168,6 +183,11 @@ def vertical_edge_map(gray_s):
 
 
 def detect_card_boxes(gray_s, bgmask, axis, dpi, filename=None):
+    lenient_long_min = LONG_SIDE_RANGE_IN[0] * dpi * 0.85
+    lenient_long_max = LONG_SIDE_RANGE_IN[1] * dpi * 1.15
+    lenient_short_min = SHORT_SIDE_RANGE_IN[0] * dpi * 0.85
+    lenient_short_max = SHORT_SIDE_RANGE_IN[1] * dpi * 1.15
+
     fg = ~bgmask
     labels, n = ndi.label(fg)
     if n < 2:
@@ -180,31 +200,67 @@ def detect_card_boxes(gray_s, bgmask, axis, dpi, filename=None):
     for sl in slices:
         h = sl[0].stop - sl[0].start
         w = sl[1].stop - sl[1].start
-        if plausible_postcard_dims(w * 2, h * 2, dpi):
-            candidates.append((sl, w * h))
+        long_side = max(w * 2, h * 2)
+        short_side = min(w * 2, h * 2)
+        plausible = (
+            lenient_short_min <= short_side <= lenient_short_max and
+            lenient_long_min <= long_side <= lenient_long_max
+        )
+
+        if plausible:
+            cx = (sl[1].start + sl[1].stop) / 2.0
+            cy = (sl[0].start + sl[0].stop) / 2.0
+            candidates.append({
+                "slice": sl,
+                "area": w * h,
+                "cx": cx,
+                "cy": cy,
+            })
 
     if len(candidates) < 2:
         log_debug(filename, axis, f"not enough postcard-like blobs ({len(candidates)})")
         return None
 
-    candidates.sort(key=lambda x: x[1], reverse=True)
-    (sl1, _), (sl2, _) = candidates[:2]
+    best_pair: Optional[Tuple[dict, dict]] = None
+    best_sep = -1.0
+
+    for i, c1 in enumerate(candidates):
+        for c2 in candidates[i + 1:]:
+            if axis == "vertical":
+                sep = abs(c1["cx"] - c2["cx"])
+            else:
+                sep = abs(c1["cy"] - c2["cy"])
+            if sep > best_sep:
+                best_sep = sep
+                best_pair = (c1, c2)
+
+    if best_pair is None:
+        log_debug(filename, axis, "unable to pair postcard blobs")
+        return None
+
+    sl1 = best_pair[0]["slice"]
+    sl2 = best_pair[1]["slice"]
 
     if axis == "vertical":
-        gap_start = min(sl1[1].stop, sl2[1].stop)
-        gap_end = max(sl1[1].start, sl2[1].start)
+        left, right = (sl1, sl2) if best_pair[0]["cx"] <= best_pair[1]["cx"] else (sl2, sl1)
+        gap_start = left[1].stop
+        gap_end = right[1].start
     else:
-        gap_start = min(sl1[0].stop, sl2[0].stop)
-        gap_end = max(sl1[0].start, sl2[0].start)
+        top, bottom = (sl1, sl2) if best_pair[0]["cy"] <= best_pair[1]["cy"] else (sl2, sl1)
+        gap_start = top[0].stop
+        gap_end = bottom[0].start
 
     if gap_end <= gap_start:
-        log_debug(filename, axis, "structural gap collapsed (gap <= 0)")
-        return None
+        seam = int(round((best_pair[0]["cx"] + best_pair[1]["cx"]) / 2.0)) if axis == "vertical" else \
+            int(round((best_pair[0]["cy"] + best_pair[1]["cy"]) / 2.0))
+        log_debug(filename, axis, "structural gap collapsed; using centroid midpoint")
+        return np.clip(seam, 1, gray_s.shape[1] - 2 if axis == "vertical" else gray_s.shape[0] - 2)
 
     gap_span = gap_end - gap_start
     if gap_span < 0.03 * gray_s.shape[1]:
-        log_debug(filename, axis, f"gap too small ({gap_span}px)")
-        return None
+        seam = (gap_start + gap_end) // 2
+        log_debug(filename, axis, f"gap narrow ({gap_span}px); using midpoint")
+        return seam
 
     return (gap_start + gap_end) // 2
 
@@ -212,7 +268,7 @@ def detect_card_boxes(gray_s, bgmask, axis, dpi, filename=None):
 def find_boundary(gray_s, color_s, bgmask, axis, dpi, filename=None, orig_shape=None):
     Hs, Ws = gray_s.shape
     if Hs < 40 or Ws < 40:
-        return None
+        return None, "geometry-too-small"
 
     log_debug(
         filename,
@@ -220,10 +276,27 @@ def find_boundary(gray_s, color_s, bgmask, axis, dpi, filename=None, orig_shape=
         f"searching boundary: sampled_shape=({Ws}x{Hs}), dpi={dpi:.1f}"
     )
 
+    scale = orig_shape[1] / gray_s.shape[1] if orig_shape else 2.0
+    full_w = Ws * scale
+    full_h = Hs * scale
+
+    def halves_plausible_at(s):
+        lw, rw = s, Ws - s
+        if axis == "vertical":
+            return (
+                plausible_postcard_dims(lw * scale, full_h, dpi) and
+                plausible_postcard_dims(rw * scale, full_h, dpi)
+            )
+        return (
+            plausible_postcard_dims(full_w, lw * scale, dpi) and
+            plausible_postcard_dims(full_w, rw * scale, dpi)
+        )
+
     structural = detect_card_boxes(gray_s, bgmask, axis, dpi, filename)
     if structural is not None:
-        log_debug(filename, axis, "structural detection used")
-        return structural, 1.0
+        seam = int(np.clip(structural, 1, Ws - 2))
+        log_debug(filename, axis, "stage=STRUCTURAL")
+        return SeamResult(seam, 1.0, "STRUCTURAL"), "STRUCTURAL"
 
     band = slice(int(0.15 * Hs), int(0.85 * Hs))
     band_gray = gray_s[band]
@@ -232,7 +305,7 @@ def find_boundary(gray_s, color_s, bgmask, axis, dpi, filename=None, orig_shape=
     margin = max(4, int(0.07 * Ws))
     idx = np.arange(margin, Ws - margin)
     if idx.size == 0:
-        return None
+        return None, "geometry-too-narrow"
 
     edge = vertical_edge_map(gray_s)[band]
     seam_align = ((edge >= np.percentile(edge, 60)) &
@@ -258,23 +331,7 @@ def find_boundary(gray_s, color_s, bgmask, axis, dpi, filename=None, orig_shape=
     dissim = np.mean(np.abs(mean_l - mean_r), axis=1)
     anchor = int(idx[np.argmax(dissim)])
 
-    scale = orig_shape[1] / gray_s.shape[1] if orig_shape else 2.0
-
-    geom_ok = []
-    for s in idx:
-        lw, rw = s, Ws - s
-        if axis == "vertical":
-            geom_ok.append(
-                plausible_postcard_dims(lw * scale, Hs * scale, dpi) and
-                plausible_postcard_dims(rw * scale, Hs * scale, dpi)
-            )
-        else:
-            geom_ok.append(
-                plausible_postcard_dims(Ws * scale, lw * scale, dpi) and
-                plausible_postcard_dims(Ws * scale, rw * scale, dpi)
-            )
-
-    geom_ok = np.array(geom_ok, dtype=bool)
+    geom_ok = np.array([halves_plausible_at(int(s)) for s in idx], dtype=bool)
 
     valid = (
         (bg_ratio[idx] >= 0.60) &
@@ -284,62 +341,66 @@ def find_boundary(gray_s, color_s, bgmask, axis, dpi, filename=None, orig_shape=
         geom_ok
     )
 
-    if not np.any(valid):
-        # Fallback to dissimilarity anchor if geometry is valid
-        lw = anchor
-        rw = Ws - anchor
+    if np.any(valid):
+        score = bg_ratio[idx] * valid
+        best = np.argmax(score)
+        split = int(idx[best])
+        confidence = float(score[best])
+        log_debug(
+            filename,
+            axis,
+            f"stage=STRICT_HEURISTIC seam candidate count={valid.sum()} best_split={split} confidence={confidence:.3f}"
+        )
 
-        if axis == "vertical":
-            geom_ok = (
-                plausible_postcard_dims(lw * scale, Hs * scale, dpi) and
-                plausible_postcard_dims(rw * scale, Hs * scale, dpi)
-            )
+        best_retry = None
+        best_score = -1
+        for dx in range(-RETRY_RADIUS_PX, RETRY_RADIUS_PX + 1, RETRY_STEP_PX):
+            s = split + dx
+            if s <= 0 or s >= Ws:
+                continue
+            if bg_ratio[s] >= 0.60 and ink_ratio[s] <= 0.25:
+                score_retry = bg_ratio[s] - abs(dx) / RETRY_RADIUS_PX
+                if score_retry > best_score:
+                    best_score = score_retry
+                    best_retry = s
+
+        final_split = best_retry if best_retry is not None else split
+        final_confidence = float(best_score) if best_retry is not None else confidence
+        if best_retry is None:
+            log_debug(filename, axis, "retry sweep did not improve seam; using strict heuristic result")
         else:
-            geom_ok = (
-                plausible_postcard_dims(Ws * scale, lw * scale, dpi) and
-                plausible_postcard_dims(Ws * scale, rw * scale, dpi)
-            )
+            log_debug(filename, axis, f"retry sweep seam={best_retry} score={best_score:.3f}")
 
-        if geom_ok:
-            log_debug(
-                filename,
-                axis,
-                f"fallback to dissimilarity anchor (anchor={anchor}, dpi={dpi:.1f})"
-            )
-            return anchor, 0.20  # low but non-zero confidence
+        return SeamResult(int(final_split), final_confidence, "STRICT_HEURISTIC"), "STRICT_HEURISTIC"
 
-        log_debug(filename, axis, "no valid seam candidates after scoring")
-        return None
+    # Stage C — Geometry anchored fallback
+    if halves_plausible_at(anchor) and bg_ratio[anchor] >= 0.40:
+        log_debug(
+            filename,
+            axis,
+            f"stage=GEOMETRY_FALLBACK anchor={anchor} bg_ratio={bg_ratio[anchor]:.3f}"
+        )
+        return SeamResult(int(anchor), 0.20, "GEOMETRY_FALLBACK"), "GEOMETRY_FALLBACK"
 
-    score = bg_ratio[idx] * valid
-    best = np.argmax(score)
-    split = int(idx[best])
-    confidence = float(score[best])
-    log_debug(
-        filename,
-        axis,
-        f"seam candidate count={valid.sum()} best_split={split} confidence={confidence:.3f}"
-    )
+    # Stage D — Forced geometry split
+    center = Ws // 2
+    geometry_center_ok = halves_plausible_at(center)
+    margin_allowance = 0.08
+    grid_card_w = max(full_w / 2 * (1 - margin_allowance), full_w / 2 - margin_allowance * full_w)
+    grid_card_h = max(full_h / 2 * (1 - margin_allowance), full_h / 2 - margin_allowance * full_h)
+    grid_plausible = plausible_postcard_dims(grid_card_w, grid_card_h, dpi)
 
-    # Retry sweep
-    best = None
-    best_score = -1
-    for dx in range(-RETRY_RADIUS_PX, RETRY_RADIUS_PX + 1, RETRY_STEP_PX):
-        s = split + dx
-        if s <= 0 or s >= Ws:
-            continue
-        if bg_ratio[s] >= 0.60 and ink_ratio[s] <= 0.25:
-            score = bg_ratio[s] - abs(dx) / RETRY_RADIUS_PX
-            if score > best_score:
-                best_score = score
-                best = s
+    if geometry_center_ok or grid_plausible:
+        log_debug(
+            filename,
+            axis,
+            "stage=FORCED_GRID_SPLIT (geometry_center_ok=%s, grid_plausible=%s)" %
+            (geometry_center_ok, grid_plausible)
+        )
+        return SeamResult(int(center), 0.10, "FORCED_GRID_SPLIT"), "FORCED_GRID_SPLIT"
 
-    if best is None:
-        log_debug(filename, axis, "retry sweep failed to improve seam")
-        return None
-
-    log_debug(filename, axis, f"retry sweep seam={best} score={best_score:.3f}")
-    return best, best_score
+    log_debug(filename, axis, "no valid seam candidates after staged search (geometry rejected)")
+    return None, "geometry-invalid"
 
 
 # ============================================================
@@ -366,8 +427,9 @@ def split_once(img, axis, filename=None, context: Optional[SplitContext] = None)
     gray_s = gray[::2, ::2]
     color_s = color[::2, ::2]
 
+    scale = gray.shape[1] / gray_s.shape[1]
     bgmask = build_bgmask(gray_s)
-    result = find_boundary(
+    seam_result, reason = find_boundary(
         gray_s,
         color_s,
         bgmask,
@@ -377,20 +439,30 @@ def split_once(img, axis, filename=None, context: Optional[SplitContext] = None)
         gray.shape
     )
 
-    if not result:
-        log_debug(filename, axis, f"no split found (dpi={ctx.dpi:.1f})")
-        return [img.copy()]
+    if seam_result is None:
+        log_debug(filename, axis, f"no split found (reason={reason}, dpi={ctx.dpi:.1f})")
+        if reason == "geometry-invalid":
+            return [img.copy()]
 
-    split_s, _ = result
-    scale = gray.shape[1] / gray_s.shape[1]
-    split = int(round(split_s * scale))
+        fallback_split = int(round((gray_s.shape[1] // 2) * scale))
+        log_debug(
+            filename,
+            axis,
+            f"forcing fallback seam at {fallback_split}px after staged search failure"
+        )
+        split = fallback_split
+        stage_used = "FORCED_FALLBACK"
+    else:
+        split_s = seam_result.position
+        split = int(round(split_s * scale))
+        stage_used = seam_result.stage
     overlap = max(16, int(0.01 * gray.shape[1]))
 
     if ctx.debug:
         log_debug(
             filename,
             axis,
-            f"split chosen at {split}px (downsampled {split_s}px, overlap={overlap}px)"
+            f"split chosen at {split}px (stage={stage_used}, overlap={overlap}px)"
         )
 
     if axis == "horizontal":
