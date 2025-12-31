@@ -103,12 +103,17 @@ def classify_background(gray_s):
 
 def thresholds_from_border(bg_mode, border):
     if bg_mode == "white":
-        return {"WHITE_T": max(200, int(np.percentile(border, 25) - 5))}
+        p70 = np.percentile(border, 70)
+        p90 = np.percentile(border, 90)
+        seed = int(np.clip(p90 - 2, 205, 252))
+        grow = int(np.clip(p70 - 10, 190, seed))
+        return {"WHITE_SEED_T": seed, "WHITE_GROW_T": grow}
     if bg_mode == "black":
         t = int(np.clip(np.percentile(border, 60) + 10, 25, 150))
         return {"BLACK_T": t}
     return {
-        "WHITE_T": max(200, int(np.percentile(border, 35) - 5)),
+        "WHITE_SEED_T": int(np.clip(np.percentile(border, 70) - 2, 205, 245)),
+        "WHITE_GROW_T": int(np.clip(np.percentile(border, 40) - 8, 190, 235)),
         "BLACK_T": int(np.clip(np.percentile(border, 50) + 10, 25, 150)),
     }
 
@@ -140,10 +145,21 @@ def log_debug(filename, axis, reason):
 
 def connected_bg_mask(gray_s, mode, thr):
     if mode == "white":
-        cand = gray_s >= thr
-    else:
-        cand = gray_s <= thr
+        seed_thr, grow_thr = thr
+        seeds = gray_s >= seed_thr
+        seeds = ndi.binary_closing(seeds, structure=np.ones((5, 5)), border_value=True)
 
+        labels, _ = ndi.label(seeds)
+        border_labels = np.unique(np.concatenate([
+            labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1]
+        ]))
+        border_labels = border_labels[border_labels != 0]
+        border_seed = np.isin(labels, border_labels)
+
+        grow_mask = gray_s >= grow_thr
+        return ndi.binary_propagation(border_seed, mask=grow_mask)
+
+    cand = gray_s <= thr
     cand = ndi.binary_closing(cand, structure=np.ones((5, 5)), border_value=True)
     labels, _ = ndi.label(cand)
 
@@ -166,9 +182,12 @@ def build_bgmask(gray_s):
         frac_black = float(np.mean(border <= 60))
         mode = "black" if frac_black >= frac_white else "white"
 
-    thr_key = "WHITE_T" if mode == "white" else "BLACK_T"
-    thr = thr_map.get(thr_key, 230 if mode == "white" else 80)
+    if mode == "white":
+        thr_seed = thr_map.get("WHITE_SEED_T", 238)
+        thr_grow = thr_map.get("WHITE_GROW_T", max(200, thr_seed - 12))
+        return connected_bg_mask(gray_s, mode, (thr_seed, thr_grow))
 
+    thr = thr_map.get("BLACK_T", 80)
     return connected_bg_mask(gray_s, mode, thr)
 
 

@@ -5,12 +5,12 @@ from PIL import Image, ImageDraw
 from postcard_split import split_once, SplitContext
 
 
-def build_grid(card_size, gap, margin, dpi):
+def build_grid(card_size, gap, margin, dpi, bg_color=(0, 0, 0)):
     card_w, card_h = card_size
     canvas_w = margin * 2 + card_w * 2 + gap
     canvas_h = margin * 2 + card_h * 2 + gap
 
-    bg = Image.new("RGB", (canvas_w, canvas_h), (0, 0, 0))
+    bg = Image.new("RGB", (canvas_w, canvas_h), bg_color)
     draw = ImageDraw.Draw(bg)
 
     colors = [
@@ -34,8 +34,8 @@ def build_grid(card_size, gap, margin, dpi):
 
 
 class SplitSmokeTests(unittest.TestCase):
-    def _assert_split(self, dpi, card_size):
-        img = build_grid(card_size, gap=60, margin=40, dpi=dpi)
+    def _assert_split(self, dpi, card_size, bg_color=(0, 0, 0)):
+        img = build_grid(card_size, gap=60, margin=40, dpi=dpi, bg_color=bg_color)
         ctx = SplitContext(dpi=dpi, debug=False)
 
         parts = []
@@ -52,6 +52,9 @@ class SplitSmokeTests(unittest.TestCase):
 
     def test_split_at_300_dpi(self):
         self._assert_split(300, (1350, 1950))
+
+    def test_split_on_white_background(self):
+        self._assert_split(220, (900, 1300), bg_color=(246, 246, 246))
 
 
 if __name__ == "__main__":
