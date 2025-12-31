@@ -2,7 +2,7 @@ import unittest
 
 from PIL import Image, ImageDraw
 
-from postcard_split import SplitContext, split_once
+from postcard_split import split_once, SplitContext
 
 
 def build_grid(card_size, gap, margin, dpi):
