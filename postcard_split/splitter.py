@@ -646,14 +646,11 @@ def deskew_postcard(img: Image.Image, filename=None, context: Optional[SplitCont
 
     rot_gray_s = np.array(rotated.convert("L"))[::2, ::2]
     est2 = estimate_card_angle(rot_gray_s, dpi=ctx.dpi)
-    valid2 = (
-        est2.reason not in {"too-small", "no-card-component", "insufficient-edge"} and
-        ((est2.method in {"edge-hist", "edge-blend"} and est2.confidence >= 0.18))
-    )
     before = abs(angle)
     after = abs(est2.angle)
-    improved = after <= 0.65 * before and (before - after) >= 0.15
-    if not valid2 or not improved:
+    est2_valid = est2.reason not in {"too-small", "no-card-component", "insufficient-edge"}
+    improved = after <= 0.80 * before and (before - after) >= 0.10
+    if not (est2_valid and improved):
         return DeskewResult(img, 0.0, est.reason + " | reverted: sanity-check")
 
     if ctx.debug:
