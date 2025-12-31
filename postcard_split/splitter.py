@@ -47,6 +47,11 @@ class DeskewResult:
     reason: str
 
 
+def _normalize_card_angle(angle: float) -> float:
+    """Map any angle to the nearest upright-aligned equivalent in [-45, 45]."""
+    return ((angle + 45) % 90) - 45
+
+
 # ============================================================
 # DPI helpers
 # ============================================================
@@ -158,6 +163,19 @@ def pick_fill_color(gray_s):
     if mode == "white":
         return int(np.clip(median_bg, 230, 255))
     return int(np.clip(median_bg, 200, 245))
+
+
+def _largest_foreground_component(mask):
+    labels, n = ndi.label(mask)
+    if n == 0:
+        return None, 0
+
+    counts = np.bincount(labels.ravel())
+    counts[0] = 0
+    largest_idx = int(np.argmax(counts))
+    if counts[largest_idx] < 30:
+        return None, 0
+    return labels == largest_idx, int(counts[largest_idx])
 
 
 # ============================================================
@@ -447,17 +465,40 @@ def find_boundary(gray_s, color_s, bgmask, axis, dpi, filename=None, orig_shape=
 # De-skew
 # ============================================================
 
-def _largest_foreground_component(mask):
-    labels, n = ndi.label(mask)
-    if n == 0:
-        return None
+def _gradient_angle(gray_s: np.ndarray, mask: np.ndarray) -> Tuple[Optional[float], float]:
+    """Return dominant edge angle (degrees) and confidence."""
+    g = ndi.gaussian_filter(gray_s.astype(np.float32), 1.2)
+    gx = ndi.sobel(g, axis=1)
+    gy = ndi.sobel(g, axis=0)
+    mag = np.hypot(gx, gy)
 
-    counts = np.bincount(labels.ravel())
-    counts[0] = 0
-    largest_idx = int(np.argmax(counts))
-    if counts[largest_idx] < 30:
-        return None
-    return labels == largest_idx
+    if not np.any(mask):
+        return None, 0.0
+
+    mag_masked = mag * mask
+    if np.count_nonzero(mask) < 40:
+        return None, 0.0
+
+    thresh = np.percentile(mag_masked[mask], 75)
+    strong = mag_masked >= max(thresh, 1e-3)
+    if np.count_nonzero(strong) < 20:
+        return None, 0.0
+
+    theta = np.rad2deg(np.arctan2(gy, gx))
+    theta = ((theta + 90) % 180) - 90  # fold to [-90, 90]
+
+    angles = theta[strong]
+    weights = mag_masked[strong]
+
+    bins = np.linspace(-90, 90, 181)
+    hist, edges = np.histogram(angles, bins=bins, weights=weights)
+    centers = (edges[:-1] + edges[1:]) / 2
+
+    peak_idx = int(np.argmax(hist))
+    peak_angle = centers[peak_idx]
+    confidence = float(hist[peak_idx] / (weights.sum() + 1e-6))
+
+    return _normalize_card_angle(float(peak_angle)), confidence
 
 
 def estimate_card_angle(gray_s: np.ndarray) -> Tuple[float, str]:
@@ -468,7 +509,7 @@ def estimate_card_angle(gray_s: np.ndarray) -> Tuple[float, str]:
     bgmask = build_bgmask(gray_s)
     fg = ndi.binary_fill_holes(~bgmask)
 
-    largest = _largest_foreground_component(fg)
+    largest, area = _largest_foreground_component(fg)
     if largest is None:
         return 0.0, "no-foreground"
 
@@ -484,8 +525,23 @@ def estimate_card_angle(gray_s: np.ndarray) -> Tuple[float, str]:
     angle_rad = np.arctan2(principal[0], principal[1])
     angle_deg = np.rad2deg(angle_rad)
 
-    upright_angle = ((angle_deg + 45) % 90) - 45
-    return float(upright_angle), "ok"
+    upright_angle = _normalize_card_angle(float(angle_deg))
+
+    grad_angle, grad_conf = _gradient_angle(gray_s, largest)
+    pca_conf = min(1.0, coords.shape[0] / (area + 1e-6))
+
+    if grad_angle is not None and (grad_conf >= 0.12 or pca_conf < 0.05):
+        chosen = grad_angle
+        reason = f"edge:{grad_conf:.3f}"
+    elif grad_angle is not None:
+        blend = min(0.6, grad_conf * 2.5)
+        chosen = (1 - blend) * upright_angle + blend * grad_angle
+        reason = f"blend:{blend:.3f}"
+    else:
+        chosen = upright_angle
+        reason = f"pca:{pca_conf:.3f}"
+
+    return float(_normalize_card_angle(chosen)), reason
 
 
 def deskew_postcard(img: Image.Image, filename=None, context: Optional[SplitContext] = None) -> DeskewResult:
@@ -499,12 +555,14 @@ def deskew_postcard(img: Image.Image, filename=None, context: Optional[SplitCont
 
     fill = pick_fill_color(gray_s)
     fill_rgb = (fill, fill, fill) if img.mode != "L" else fill
-    rotated = img.rotate(angle, resample=Image.BICUBIC, expand=True, fillcolor=fill_rgb)
+    applied = float(np.clip(angle, -30.0, 30.0))
+    reason_out = reason if applied == angle else f"{reason}|clamped"
+    rotated = img.rotate(applied, resample=Image.BICUBIC, expand=True, fillcolor=fill_rgb)
 
     if ctx.debug:
-        log_debug(filename, "deskew", f"angle={angle:.2f} applied")
+        log_debug(filename, "deskew", f"angle={angle:.2f} applied={applied:.2f} reason={reason_out}")
 
-    return DeskewResult(rotated, angle, reason)
+    return DeskewResult(rotated, applied, reason_out)
 
 
 # ============================================================
