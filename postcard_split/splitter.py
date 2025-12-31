@@ -40,6 +40,18 @@ class SeamResult:
     stage: str
 
 
+@dataclass
+class DeskewResult:
+    image: Image.Image
+    angle_applied: float
+    reason: str
+
+
+def _normalize_card_angle(angle: float) -> float:
+    """Map any angle to the nearest upright-aligned equivalent in [-45, 45]."""
+    return ((angle + 45) % 90) - 45
+
+
 # ============================================================
 # DPI helpers
 # ============================================================
@@ -137,6 +149,33 @@ def log_debug(filename, axis, reason):
     if DEBUG_SEAMS:
         name = filename or "unknown"
         print(f"[DEBUG seam] file={name} axis={axis} reason={reason}")
+    return reason
+
+
+def pick_fill_color(gray_s):
+    mode, border = classify_background(gray_s)
+    if border.size == 0:
+        return 240
+
+    median_bg = float(np.median(border))
+    if mode == "black":
+        return int(np.clip(median_bg, 0, 50))
+    if mode == "white":
+        return int(np.clip(median_bg, 230, 255))
+    return int(np.clip(median_bg, 200, 245))
+
+
+def _largest_foreground_component(mask):
+    labels, n = ndi.label(mask)
+    if n == 0:
+        return None, 0
+
+    counts = np.bincount(labels.ravel())
+    counts[0] = 0
+    largest_idx = int(np.argmax(counts))
+    if counts[largest_idx] < 30:
+        return None, 0
+    return labels == largest_idx, int(counts[largest_idx])
 
 
 # ============================================================
@@ -423,6 +462,110 @@ def find_boundary(gray_s, color_s, bgmask, axis, dpi, filename=None, orig_shape=
 
 
 # ============================================================
+# De-skew
+# ============================================================
+
+def _gradient_angle(gray_s: np.ndarray, mask: np.ndarray) -> Tuple[Optional[float], float]:
+    """Return dominant edge angle (degrees) and confidence."""
+    g = ndi.gaussian_filter(gray_s.astype(np.float32), 1.2)
+    gx = ndi.sobel(g, axis=1)
+    gy = ndi.sobel(g, axis=0)
+    mag = np.hypot(gx, gy)
+
+    if not np.any(mask):
+        return None, 0.0
+
+    mag_masked = mag * mask
+    if np.count_nonzero(mask) < 40:
+        return None, 0.0
+
+    thresh = np.percentile(mag_masked[mask], 75)
+    strong = mag_masked >= max(thresh, 1e-3)
+    if np.count_nonzero(strong) < 20:
+        return None, 0.0
+
+    theta = np.rad2deg(np.arctan2(gy, gx))
+    theta = ((theta + 90) % 180) - 90  # fold to [-90, 90]
+
+    angles = theta[strong]
+    weights = mag_masked[strong]
+
+    bins = np.linspace(-90, 90, 181)
+    hist, edges = np.histogram(angles, bins=bins, weights=weights)
+    centers = (edges[:-1] + edges[1:]) / 2
+
+    peak_idx = int(np.argmax(hist))
+    peak_angle = centers[peak_idx]
+    confidence = float(hist[peak_idx] / (weights.sum() + 1e-6))
+
+    return _normalize_card_angle(float(peak_angle)), confidence
+
+
+def estimate_card_angle(gray_s: np.ndarray) -> Tuple[float, str]:
+    """Estimate the dominant axis angle (degrees) of the postcard."""
+    if min(gray_s.shape) < 20:
+        return 0.0, "too-small"
+
+    bgmask = build_bgmask(gray_s)
+    fg = ndi.binary_fill_holes(~bgmask)
+
+    largest, area = _largest_foreground_component(fg)
+    if largest is None:
+        return 0.0, "no-foreground"
+
+    coords = np.column_stack(np.nonzero(largest))
+    if coords.shape[0] < 40:
+        return 0.0, "insufficient-foreground"
+
+    coords_centered = coords - coords.mean(axis=0)
+    cov = np.cov(coords_centered, rowvar=False)
+    evals, evecs = np.linalg.eigh(cov)
+    principal = evecs[:, np.argmax(evals)]
+
+    angle_rad = np.arctan2(principal[0], principal[1])
+    angle_deg = np.rad2deg(angle_rad)
+
+    upright_angle = _normalize_card_angle(float(angle_deg))
+
+    grad_angle, grad_conf = _gradient_angle(gray_s, largest)
+    pca_conf = min(1.0, coords.shape[0] / (area + 1e-6))
+
+    if grad_angle is not None and (grad_conf >= 0.12 or pca_conf < 0.05):
+        chosen = grad_angle
+        reason = f"edge:{grad_conf:.3f}"
+    elif grad_angle is not None:
+        blend = min(0.6, grad_conf * 2.5)
+        chosen = (1 - blend) * upright_angle + blend * grad_angle
+        reason = f"blend:{blend:.3f}"
+    else:
+        chosen = upright_angle
+        reason = f"pca:{pca_conf:.3f}"
+
+    return float(_normalize_card_angle(chosen)), reason
+
+
+def deskew_postcard(img: Image.Image, filename=None, context: Optional[SplitContext] = None) -> DeskewResult:
+    ctx = context or SplitContext(dpi=get_effective_dpi(img), debug=False)
+
+    gray = np.array(img.convert("L"))
+    gray_s = gray[::2, ::2]
+    angle, reason = estimate_card_angle(gray_s)
+    if abs(angle) < 0.15:
+        return DeskewResult(img, 0.0, reason)
+
+    fill = pick_fill_color(gray_s)
+    fill_rgb = (fill, fill, fill) if img.mode != "L" else fill
+    applied = float(np.clip(angle, -30.0, 30.0))
+    reason_out = reason if applied == angle else f"{reason}|clamped"
+    rotated = img.rotate(applied, resample=Image.BICUBIC, expand=True, fillcolor=fill_rgb)
+
+    if ctx.debug:
+        log_debug(filename, "deskew", f"angle={angle:.2f} applied={applied:.2f} reason={reason_out}")
+
+    return DeskewResult(rotated, applied, reason_out)
+
+
+# ============================================================
 # Axis-aware split
 # ============================================================
 
@@ -568,11 +711,12 @@ def main():
             print(f"WARNING: {scan_path.name} produced {len(parts)} parts")
 
         for idx, p in enumerate(parts, 1):
+            deskewed = deskew_postcard(p, scan_path.name, context).image
             if is_front:
                 fname = f"postcard_{idx}_front.jpg"
             else:
                 fname = f"postcard_{BACK_MIRROR_MAP[idx]}_back.jpg"
-            p.save(out_dir / fname, quality=95)
+            deskewed.save(out_dir / fname, quality=95)
 
         print(f"[OK] {scan_path.name}")
 
