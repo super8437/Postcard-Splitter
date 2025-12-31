@@ -1,7 +1,7 @@
 from PIL import Image
 import numpy as np
 
-from postcard_split import split_once
+from postcard_split import split_once, SplitContext
 
 
 def make_fake_scan(width=2400, height=1600):
