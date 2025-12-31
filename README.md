@@ -10,6 +10,7 @@ python postcard_split.py [-d|--debug-seams] <image_or_directory> ...
 
 * Provide one or more image paths or directories (JPEG/PNG/TIFF files are discovered in directories).
 * Use `-d` / `--debug-seams` to print seam-finding diagnostics, including the computed DPI and why a seam was accepted or rejected.
+* Each postcard is automatically de-skewed before saving by estimating the dominant axis of the foreground card and rotating it back to upright alignment.
 
 ### DPI handling
 
