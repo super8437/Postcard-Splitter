@@ -663,6 +663,199 @@ def deskew_postcard(img: Image.Image, filename=None, context: Optional[SplitCont
 
 
 # ============================================================
+# Post de-skew cropping
+# ============================================================
+
+def _dual_bgmask(gray_s: np.ndarray):
+    bg_mode, border = classify_background(gray_s)
+    thr_map = thresholds_from_border(bg_mode, border)
+
+    seed_white = thr_map.get("WHITE_SEED_T", 238)
+    grow_white = thr_map.get("WHITE_GROW_T", max(200, seed_white - 12))
+    thr_black = thr_map.get("BLACK_T", 80)
+
+    mask_white = connected_bg_mask(gray_s, "white", (seed_white, grow_white))
+    mask_black = connected_bg_mask(gray_s, "black", thr_black)
+
+    white_score = float(mask_white.sum())
+    black_score = float(mask_black.sum())
+
+    if white_score >= black_score:
+        return mask_white, "white"
+    return mask_black, "black"
+
+
+def _edge_refine_mask(gray_s: np.ndarray, fgmask: np.ndarray):
+    if gray_s.size == 0:
+        return fgmask
+
+    g = ndi.gaussian_filter(gray_s.astype(np.float32), 1.0)
+    gx = ndi.sobel(g, axis=1)
+    gy = ndi.sobel(g, axis=0)
+    mag = np.hypot(gx, gy)
+
+    if fgmask.any():
+        mag_vals = mag[fgmask]
+    else:
+        mag_vals = mag.ravel()
+
+    if mag_vals.size == 0:
+        return fgmask
+
+    base_thr = 78
+    thr = np.percentile(mag_vals, base_thr)
+    edges = mag >= thr
+    edges &= fgmask
+    edge_fraction = edges.mean()
+
+    if edge_fraction < 0.005:
+        thr = np.percentile(mag_vals, 68)
+        edges = mag >= thr
+        edges &= fgmask
+
+    edges = ndi.binary_dilation(edges, iterations=2)
+    hull = ndi.binary_fill_holes(edges)
+    hull = ndi.binary_dilation(hull, iterations=1)
+
+    refined = fgmask | hull
+    refined = ndi.binary_closing(refined, structure=np.ones((3, 3)))
+    refined = ndi.binary_fill_holes(refined)
+    return refined
+
+
+def _strip_perforation_bands(mask: np.ndarray, gray_s: np.ndarray):
+    """
+    Attempt to remove thin perforation bands along the borders.
+    Looks for narrow bands (1–3% of size) with periodic dark holes.
+    """
+    if mask.size == 0:
+        return mask
+
+    H, W = mask.shape
+    band_w = max(1, int(0.02 * W))
+    band_h = max(1, int(0.02 * H))
+
+    def remove_band(band_slice, axis):
+        band = gray_s[band_slice]
+        if band.size == 0:
+            return
+        proj = band.mean(axis=axis)
+        if proj.size < 8:
+            return
+        diffs = np.abs(np.diff(proj))
+        if diffs.size < 4:
+            return
+        periodicity = np.percentile(diffs, 80)
+        contrast = proj.max() - proj.min()
+        if contrast > 8 and periodicity >= 3:
+            mask[band_slice] = False
+
+    remove_band((slice(None), slice(0, band_w)), axis=0)
+    remove_band((slice(None), slice(W - band_w, W)), axis=0)
+    remove_band((slice(0, band_h), slice(None)), axis=1)
+    remove_band((slice(H - band_h, H), slice(None)), axis=1)
+    return mask
+
+
+def tight_crop_postcard(img: Image.Image, filename=None, context: Optional[SplitContext] = None):
+    ctx = context or SplitContext(dpi=get_effective_dpi(img), debug=False)
+
+    gray = np.array(img.convert("L"))
+    gray_s = gray[::2, ::2]
+    scale = gray.shape[1] / gray_s.shape[1]
+
+    bgmask_s, dom_mode = _dual_bgmask(gray_s)
+    fgmask = ~bgmask_s
+    fgmask = ndi.binary_fill_holes(fgmask)
+    fgmask = ndi.binary_opening(fgmask, structure=np.ones((3, 3)))
+    fgmask = _strip_perforation_bands(fgmask, gray_s)
+
+    refined = _edge_refine_mask(gray_s, fgmask)
+
+    comp = _pick_card_component(refined, dpi=ctx.dpi, scale_to_full=scale)
+    if comp is None:
+        comp, _ = _largest_foreground_component(refined)
+
+    if comp is None:
+        return img
+
+    bb = _mask_bbox(comp)
+    if bb is None:
+        return img
+
+    x0, y0, x1, y1 = bb
+    bw, bh = (x1 - x0), (y1 - y0)
+    plausible = plausible_postcard_dims(bw * scale, bh * scale, ctx.dpi)
+
+    if not plausible:
+        comp_fallback, _ = _largest_foreground_component(fgmask)
+        bb_fb = _mask_bbox(comp_fallback) if comp_fallback is not None else None
+        if bb_fb is not None:
+            x0, y0, x1, y1 = bb_fb
+            bw, bh = (x1 - x0), (y1 - y0)
+            plausible = plausible_postcard_dims(bw * scale, bh * scale, ctx.dpi)
+
+    aspect = bw / max(1, bh)
+    exp_long = _mean(LONG_SIDE_RANGE_IN) * ctx.dpi / BASE_DPI
+    exp_short = _mean(SHORT_SIDE_RANGE_IN) * ctx.dpi / BASE_DPI
+    exp_area = exp_long * exp_short
+    bbox_area = bw * bh
+    aspect_ok = 0.6 <= aspect <= 1.4
+    area_ok = bbox_area >= 0.70 * exp_area
+
+    if not (plausible and aspect_ok and area_ok):
+        grow_x = max(0, int(0.05 * bw))
+        grow_y = max(0, int(0.05 * bh))
+        x0 = max(0, x0 - grow_x)
+        y0 = max(0, y0 - grow_y)
+        x1 = min(gray_s.shape[1], x1 + grow_x)
+        y1 = min(gray_s.shape[0], y1 + grow_y)
+        bw, bh = (x1 - x0), (y1 - y0)
+        bbox_area = bw * bh
+        aspect = bw / max(1, bh)
+        area_ok = bbox_area >= 0.70 * exp_area
+        aspect_ok = 0.6 <= aspect <= 1.4
+        plausible = plausible_postcard_dims(bw * scale, bh * scale, ctx.dpi)
+
+    if not (plausible and aspect_ok and area_ok):
+        return img
+
+    pad_frac = 0.02 if dom_mode == "white" else 0.008
+    pad_frac = 0.012 if dom_mode not in ("white", "black") else pad_frac
+    edge_density = refined.mean()
+    if edge_density < 0.01:
+        pad_frac *= 1.5
+
+    min_pad = int(np.clip(ctx.dpi / BASE_DPI * 12, 10, 18))
+    pad_x = max(min_pad, int(round(bw * pad_frac)))
+    pad_y = max(min_pad, int(round(bh * pad_frac)))
+
+    x0_full = max(0, int(round(x0 * scale)) - pad_x)
+    y0_full = max(0, int(round(y0 * scale)) - pad_y)
+    x1_full = min(img.width, int(round(x1 * scale)) + pad_x)
+    y1_full = min(img.height, int(round(y1 * scale)) + pad_y)
+
+    if (
+        x1_full <= x0_full + 4 or
+        y1_full <= y0_full + 4 or
+        x0_full < 0 or y0_full < 0 or
+        x1_full > img.width or y1_full > img.height
+    ):
+        return img
+
+    cropped = img.crop((x0_full, y0_full, x1_full, y1_full))
+
+    if ctx.debug:
+        log_debug(
+            filename,
+            "crop",
+            f"mode={dom_mode} pad=({pad_x},{pad_y}) box=({x0_full},{y0_full},{x1_full},{y1_full})"
+        )
+
+    return cropped
+
+
+# ============================================================
 # Axis-aware split
 # ============================================================
 
@@ -809,11 +1002,12 @@ def main():
 
         for idx, p in enumerate(parts, 1):
             deskewed = deskew_postcard(p, scan_path.name, context).image
+            cropped = tight_crop_postcard(deskewed, scan_path.name, context)
             if is_front:
                 fname = f"postcard_{idx}_front.jpg"
             else:
                 fname = f"postcard_{BACK_MIRROR_MAP[idx]}_back.jpg"
-            deskewed.save(out_dir / fname, quality=95)
+            cropped.save(out_dir / fname, quality=95)
 
         print(f"[OK] {scan_path.name}")
 
