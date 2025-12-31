@@ -1,15 +1,16 @@
-import sys
+import argparse
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable, Optional
 
 import numpy as np
 import scipy.ndimage as ndi
 from PIL import Image
 
-# === Postcard geometry at 200 DPI ===
-POSTCARD_MIN_W = 600
-POSTCARD_MAX_W = 1100
-POSTCARD_MIN_H = 900
-POSTCARD_MAX_H = 1500
+# === Postcard geometry (physical, scaled by DPI) ===
+BASE_DPI = 200
+LONG_SIDE_RANGE_IN = (5.0, 6.5)
+SHORT_SIDE_RANGE_IN = (3.0, 4.5)
 
 # Retry search
 RETRY_RADIUS_PX = 150
@@ -18,11 +19,49 @@ RETRY_STEP_PX = 10
 # Ink threshold (light cards safe)
 INK_THRESHOLD = 190
 
-# Debug flag (silent by default)
-DEBUG_SEAMS = False
+@dataclass
+class SplitContext:
+    dpi: float
+    debug: bool
 
-# Soft confidence threshold to trigger retry
-CONFIDENCE_SOFT_THRESHOLD = 0.25
+    @property
+    def dpi_scale(self):
+        return self.dpi / BASE_DPI
+
+
+DEBUG_SEAMS = False  # set by CLI
+
+
+# ============================================================
+# DPI helpers
+# ============================================================
+
+def _mean(values: Iterable[float]) -> float:
+    vals = [float(v) for v in values if v]
+    return float(sum(vals) / len(vals)) if vals else 0.0
+
+
+def get_effective_dpi(img: Image.Image, grid: tuple[int, int] = (2, 2)) -> float:
+    """Prefer embedded DPI; otherwise, estimate from a 2x2 postcard grid."""
+    dpi_info = img.info.get("dpi")
+    if isinstance(dpi_info, tuple) and len(dpi_info) >= 2:
+        valid = [d for d in dpi_info[:2] if isinstance(d, (int, float)) and d > 10]
+        if valid:
+            return float(_mean(valid))
+
+    # Estimate: assume a grid of postcards (default 2x2) roughly matching the
+    # physical ranges below.
+    long_mid = _mean(LONG_SIDE_RANGE_IN)
+    short_mid = _mean(SHORT_SIDE_RANGE_IN)
+    exp_w_in = long_mid * grid[0]
+    exp_h_in = short_mid * grid[1]
+
+    est_w_dpi = img.width / exp_w_in
+    est_h_dpi = img.height / exp_h_in
+    estimate = _mean([est_w_dpi, est_h_dpi]) or BASE_DPI
+
+    # Clamp to a realistic range for flatbed scans.
+    return float(np.clip(estimate, 180, 800))
 
 
 # ============================================================
@@ -66,10 +105,18 @@ def thresholds_from_border(bg_mode, border):
     }
 
 
-def plausible_postcard_dims(card_w, card_h):
+def plausible_postcard_dims(card_w, card_h, dpi):
+    long_min = LONG_SIDE_RANGE_IN[0] * dpi
+    long_max = LONG_SIDE_RANGE_IN[1] * dpi
+    short_min = SHORT_SIDE_RANGE_IN[0] * dpi
+    short_max = SHORT_SIDE_RANGE_IN[1] * dpi
+
+    long_side = max(card_w, card_h)
+    short_side = min(card_w, card_h)
+
     return (
-        POSTCARD_MIN_W <= card_w <= POSTCARD_MAX_W and
-        POSTCARD_MIN_H <= card_h <= POSTCARD_MAX_H
+        short_min <= short_side <= short_max and
+        long_min <= long_side <= long_max
     )
 
 
@@ -120,10 +167,11 @@ def vertical_edge_map(gray_s):
     return ndi.gaussian_filter(np.abs(gx), 1.0)
 
 
-def detect_card_boxes(gray_s, bgmask, axis):
+def detect_card_boxes(gray_s, bgmask, axis, dpi, filename=None):
     fg = ~bgmask
     labels, n = ndi.label(fg)
     if n < 2:
+        log_debug(filename, axis, f"no fg components (n={n})")
         return None
 
     slices = ndi.find_objects(labels)
@@ -132,10 +180,11 @@ def detect_card_boxes(gray_s, bgmask, axis):
     for sl in slices:
         h = sl[0].stop - sl[0].start
         w = sl[1].stop - sl[1].start
-        if plausible_postcard_dims(w * 2, h * 2):
+        if plausible_postcard_dims(w * 2, h * 2, dpi):
             candidates.append((sl, w * h))
 
     if len(candidates) < 2:
+        log_debug(filename, axis, f"not enough postcard-like blobs ({len(candidates)})")
         return None
 
     candidates.sort(key=lambda x: x[1], reverse=True)
@@ -149,20 +198,29 @@ def detect_card_boxes(gray_s, bgmask, axis):
         gap_end = max(sl1[0].start, sl2[0].start)
 
     if gap_end <= gap_start:
+        log_debug(filename, axis, "structural gap collapsed (gap <= 0)")
         return None
 
-    if (gap_end - gap_start) < 0.03 * gray_s.shape[1]:
+    gap_span = gap_end - gap_start
+    if gap_span < 0.03 * gray_s.shape[1]:
+        log_debug(filename, axis, f"gap too small ({gap_span}px)")
         return None
 
     return (gap_start + gap_end) // 2
 
 
-def find_boundary(gray_s, color_s, bgmask, axis, filename=None, orig_shape=None):
+def find_boundary(gray_s, color_s, bgmask, axis, dpi, filename=None, orig_shape=None):
     Hs, Ws = gray_s.shape
     if Hs < 40 or Ws < 40:
         return None
 
-    structural = detect_card_boxes(gray_s, bgmask, axis)
+    log_debug(
+        filename,
+        axis,
+        f"searching boundary: sampled_shape=({Ws}x{Hs}), dpi={dpi:.1f}"
+    )
+
+    structural = detect_card_boxes(gray_s, bgmask, axis, dpi, filename)
     if structural is not None:
         log_debug(filename, axis, "structural detection used")
         return structural, 1.0
@@ -207,13 +265,13 @@ def find_boundary(gray_s, color_s, bgmask, axis, filename=None, orig_shape=None)
         lw, rw = s, Ws - s
         if axis == "vertical":
             geom_ok.append(
-                plausible_postcard_dims(lw * scale, Hs * scale) and
-                plausible_postcard_dims(rw * scale, Hs * scale)
+                plausible_postcard_dims(lw * scale, Hs * scale, dpi) and
+                plausible_postcard_dims(rw * scale, Hs * scale, dpi)
             )
         else:
             geom_ok.append(
-                plausible_postcard_dims(Ws * scale, lw * scale) and
-                plausible_postcard_dims(Ws * scale, rw * scale)
+                plausible_postcard_dims(Ws * scale, lw * scale, dpi) and
+                plausible_postcard_dims(Ws * scale, rw * scale, dpi)
             )
 
     geom_ok = np.array(geom_ok, dtype=bool)
@@ -233,25 +291,35 @@ def find_boundary(gray_s, color_s, bgmask, axis, filename=None, orig_shape=None)
 
         if axis == "vertical":
             geom_ok = (
-                plausible_postcard_dims(lw * scale, Hs * scale) and
-                plausible_postcard_dims(rw * scale, Hs * scale)
+                plausible_postcard_dims(lw * scale, Hs * scale, dpi) and
+                plausible_postcard_dims(rw * scale, Hs * scale, dpi)
             )
         else:
             geom_ok = (
-                plausible_postcard_dims(Ws * scale, lw * scale) and
-                plausible_postcard_dims(Ws * scale, rw * scale)
+                plausible_postcard_dims(Ws * scale, lw * scale, dpi) and
+                plausible_postcard_dims(Ws * scale, rw * scale, dpi)
             )
 
         if geom_ok:
-            log_debug(filename, axis, "fallback to dissimilarity anchor")
+            log_debug(
+                filename,
+                axis,
+                f"fallback to dissimilarity anchor (anchor={anchor}, dpi={dpi:.1f})"
+            )
             return anchor, 0.20  # low but non-zero confidence
 
+        log_debug(filename, axis, "no valid seam candidates after scoring")
         return None
 
     score = bg_ratio[idx] * valid
     best = np.argmax(score)
     split = int(idx[best])
     confidence = float(score[best])
+    log_debug(
+        filename,
+        axis,
+        f"seam candidate count={valid.sum()} best_split={split} confidence={confidence:.3f}"
+    )
 
     # Retry sweep
     best = None
@@ -267,8 +335,10 @@ def find_boundary(gray_s, color_s, bgmask, axis, filename=None, orig_shape=None)
                 best = s
 
     if best is None:
+        log_debug(filename, axis, "retry sweep failed to improve seam")
         return None
 
+    log_debug(filename, axis, f"retry sweep seam={best} score={best_score:.3f}")
     return best, best_score
 
 
@@ -276,7 +346,16 @@ def find_boundary(gray_s, color_s, bgmask, axis, filename=None, orig_shape=None)
 # Axis-aware split
 # ============================================================
 
-def split_once(img, axis, filename=None):
+def split_once(img, axis, filename=None, context: Optional[SplitContext] = None):
+    ctx = context or SplitContext(dpi=get_effective_dpi(img), debug=DEBUG_SEAMS)
+
+    if ctx.debug:
+        log_debug(
+            filename,
+            axis,
+            f"starting split: size={img.size}, dpi={ctx.dpi:.1f}, scale={ctx.dpi_scale:.2f}"
+        )
+
     color = np.array(img.convert("RGB"))
     gray = np.array(img.convert("L"))
 
@@ -288,15 +367,31 @@ def split_once(img, axis, filename=None):
     color_s = color[::2, ::2]
 
     bgmask = build_bgmask(gray_s)
-    result = find_boundary(gray_s, color_s, bgmask, axis, filename, gray.shape)
+    result = find_boundary(
+        gray_s,
+        color_s,
+        bgmask,
+        axis,
+        ctx.dpi,
+        filename,
+        gray.shape
+    )
 
     if not result:
+        log_debug(filename, axis, f"no split found (dpi={ctx.dpi:.1f})")
         return [img.copy()]
 
     split_s, _ = result
     scale = gray.shape[1] / gray_s.shape[1]
     split = int(round(split_s * scale))
     overlap = max(16, int(0.01 * gray.shape[1]))
+
+    if ctx.debug:
+        log_debug(
+            filename,
+            axis,
+            f"split chosen at {split}px (downsampled {split_s}px, overlap={overlap}px)"
+        )
 
     if axis == "horizontal":
         return [
@@ -315,11 +410,26 @@ def split_once(img, axis, filename=None):
 # ============================================================
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python postcard_split.py <image_or_directory> ...")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description="Split scanned postcard grids into individual cards."
+    )
+    parser.add_argument(
+        "-d",
+        "--debug-seams",
+        action="store_true",
+        help="Enable verbose seam detection logging.",
+    )
+    parser.add_argument(
+        "inputs",
+        nargs="+",
+        help="Image files or directories containing scans.",
+    )
+    args = parser.parse_args()
 
-    inputs = [Path(p) for p in sys.argv[1:]]
+    global DEBUG_SEAMS
+    DEBUG_SEAMS = args.debug_seams
+
+    inputs = [Path(p) for p in args.inputs]
     scans = []
 
     for p in inputs:
@@ -342,6 +452,16 @@ def main():
 
     for scan_idx, scan_path in enumerate(scans):
         img = Image.open(scan_path)
+        context = SplitContext(
+            dpi=get_effective_dpi(img),
+            debug=DEBUG_SEAMS,
+        )
+        if DEBUG_SEAMS:
+            log_debug(
+                scan_path.name,
+                "both",
+                f"effective_dpi={context.dpi:.1f}, scale={context.dpi_scale:.2f}"
+            )
 
         is_front = (scan_idx % 2 == 0)
         pair_id = scan_idx // 2 + 1
@@ -350,8 +470,8 @@ def main():
         out_dir.mkdir(exist_ok=True)
 
         parts = []
-        for half in split_once(img, "horizontal", scan_path.name):
-            parts.extend(split_once(half, "vertical", scan_path.name))
+        for half in split_once(img, "horizontal", scan_path.name, context):
+            parts.extend(split_once(half, "vertical", scan_path.name, context))
 
         if len(parts) != 4:
             print(f"WARNING: {scan_path.name} produced {len(parts)} parts")
