@@ -15,8 +15,8 @@ def build_rotated_postcard(angle):
 def measure_angle(img):
     gray = np.array(img.convert("L"))
     gray_s = gray[::2, ::2]
-    angle, _ = estimate_card_angle(gray_s)
-    return angle
+    est = estimate_card_angle(gray_s)
+    return est.angle
 
 
 def test_deskew_corrects_rotation():
