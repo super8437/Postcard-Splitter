@@ -178,45 +178,6 @@ def _largest_foreground_component(mask):
     return labels == largest_idx, int(counts[largest_idx])
 
 
-def _select_card_mask(fg: np.ndarray) -> tuple[Optional[np.ndarray], int]:
-    labels, n = ndi.label(fg)
-    if n == 0:
-        return None, 0
-
-    counts = np.bincount(labels.ravel())
-    counts[0] = 0
-
-    slices = ndi.find_objects(labels)
-    best_mask = None
-    best_score = -1.0
-    best_area = 0
-
-    for idx, sl in enumerate(slices, start=1):
-        area = counts[idx]
-        if area < 40:
-            continue
-
-        h = sl[0].stop - sl[0].start
-        w = sl[1].stop - sl[1].start
-        if h == 0 or w == 0:
-            continue
-        aspect = max(w, h) / max(1, min(w, h))
-
-        aspect_score = float(np.exp(-((aspect - 1.6) ** 2) / 2.5))
-        size_score = float(np.clip(area / (fg.size + 1e-6), 0, 1.0))
-        score = aspect_score * 0.6 + size_score * 0.4
-
-        if aspect > 5.0:  # likely strip or edge artifact
-            score *= 0.4
-
-        if score > best_score:
-            best_score = score
-            best_mask = labels == idx
-            best_area = int(area)
-
-    return best_mask, best_area
-
-
 # ============================================================
 # Background mask
 # ============================================================
@@ -548,7 +509,7 @@ def estimate_card_angle(gray_s: np.ndarray) -> Tuple[float, str]:
     bgmask = build_bgmask(gray_s)
     fg = ndi.binary_fill_holes(~bgmask)
 
-    largest, area = _select_card_mask(fg)
+    largest, area = _largest_foreground_component(fg)
     if largest is None:
         return 0.0, "no-foreground"
 
@@ -569,45 +530,18 @@ def estimate_card_angle(gray_s: np.ndarray) -> Tuple[float, str]:
     grad_angle, grad_conf = _gradient_angle(gray_s, largest)
     pca_conf = min(1.0, coords.shape[0] / (area + 1e-6))
 
-    # Boundary-only PCA on the perimeter to emphasize card edges.
-    perimeter = largest ^ ndi.binary_erosion(largest, iterations=2, border_value=0)
-    edge_coords = np.column_stack(np.nonzero(perimeter))
-    edge_angle = None
-    edge_conf = 0.0
-    if edge_coords.shape[0] >= 30:
-        ec_centered = edge_coords - edge_coords.mean(axis=0)
-        cov_e = np.cov(ec_centered, rowvar=False)
-        evals_e, evecs_e = np.linalg.eigh(cov_e)
-        principal_e = evecs_e[:, np.argmax(evals_e)]
-        edge_angle = _normalize_card_angle(float(np.rad2deg(np.arctan2(principal_e[0], principal_e[1]))))
-        # Edges should be thinner, so weight by variance ratio.
-        edge_conf = float(np.max(evals_e) / (np.sum(evals_e) + 1e-6))
-
-    candidates = []
-    candidates.append(("pca", upright_angle, pca_conf))
-    if grad_angle is not None:
-        candidates.append(("edge_grad", grad_angle, grad_conf))
-    if edge_angle is not None:
-        candidates.append(("edge_pca", edge_angle, edge_conf))
-
-    # Choose the candidate with highest confidence, blending if close.
-    candidates.sort(key=lambda c: c[2], reverse=True)
-
-    if len(candidates) >= 2 and abs(candidates[0][1] - candidates[1][1]) > 45:
-        # normalize wraparound difference
-        diff = abs(_normalize_card_angle(candidates[0][1] - candidates[1][1]))
+    if grad_angle is not None and (grad_conf >= 0.12 or pca_conf < 0.05):
+        chosen = grad_angle
+        reason = f"edge:{grad_conf:.3f}"
+    elif grad_angle is not None:
+        blend = min(0.6, grad_conf * 2.5)
+        chosen = (1 - blend) * upright_angle + blend * grad_angle
+        reason = f"blend:{blend:.3f}"
     else:
-        diff = abs(candidates[0][1] - candidates[1][1]) if len(candidates) >= 2 else 0
+        chosen = upright_angle
+        reason = f"pca:{pca_conf:.3f}"
 
-    if len(candidates) >= 2 and diff < 8:
-        w0 = candidates[0][2]
-        w1 = candidates[1][2]
-        total = w0 + w1 + 1e-6
-        blended = (w0 * candidates[0][1] + w1 * candidates[1][1]) / total
-        return float(_normalize_card_angle(blended)), f"blend:{candidates[0][0]}:{candidates[1][0]}"
-
-    source, chosen_angle, conf = candidates[0]
-    return float(_normalize_card_angle(chosen_angle)), f"{source}:{conf:.3f}"
+    return float(_normalize_card_angle(chosen)), reason
 
 
 def deskew_postcard(img: Image.Image, filename=None, context: Optional[SplitContext] = None) -> DeskewResult:
@@ -616,7 +550,7 @@ def deskew_postcard(img: Image.Image, filename=None, context: Optional[SplitCont
     gray = np.array(img.convert("L"))
     gray_s = gray[::2, ::2]
     angle, reason = estimate_card_angle(gray_s)
-    if abs(angle) < 0.25:
+    if abs(angle) < 0.15:
         return DeskewResult(img, 0.0, reason)
 
     fill = pick_fill_color(gray_s)
