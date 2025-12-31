@@ -646,133 +646,20 @@ def deskew_postcard(img: Image.Image, filename=None, context: Optional[SplitCont
 
     rot_gray_s = np.array(rotated.convert("L"))[::2, ::2]
     est2 = estimate_card_angle(rot_gray_s, dpi=ctx.dpi)
+    valid2 = (
+        est2.reason not in {"too-small", "no-card-component", "insufficient-edge"} and
+        ((est2.method in {"edge-hist", "edge-blend"} and est2.confidence >= 0.18))
+    )
     before = abs(angle)
     after = abs(est2.angle)
-    est2_valid = est2.reason not in {"too-small", "no-card-component", "insufficient-edge"}
-    improved = after <= 0.80 * before and (before - after) >= 0.10
-    if not (est2_valid and improved):
+    improved = after <= 0.65 * before and (before - after) >= 0.15
+    if not valid2 or not improved:
         return DeskewResult(img, 0.0, est.reason + " | reverted: sanity-check")
 
     if ctx.debug:
         log_debug(filename, "deskew", f"method={est.method} conf={est.confidence:.2f} angle={angle:.2f}")
 
     return DeskewResult(rotated, angle, est.reason)
-
-
-# ============================================================
-# Post de-skew cropping
-# ============================================================
-
-def _dual_bgmask(gray_s: np.ndarray):
-    bg_mode, border = classify_background(gray_s)
-    thr_map = thresholds_from_border(bg_mode, border)
-
-    seed_white = thr_map.get("WHITE_SEED_T", 238)
-    grow_white = thr_map.get("WHITE_GROW_T", max(200, seed_white - 12))
-    thr_black = thr_map.get("BLACK_T", 80)
-
-    mask_white = connected_bg_mask(gray_s, "white", (seed_white, grow_white))
-    mask_black = connected_bg_mask(gray_s, "black", thr_black)
-
-    white_score = float(mask_white.sum())
-    black_score = float(mask_black.sum())
-
-    if white_score >= black_score:
-        return mask_white, "white"
-    return mask_black, "black"
-
-
-def _edge_refine_mask(gray_s: np.ndarray, fgmask: np.ndarray):
-    if gray_s.size == 0:
-        return fgmask
-
-    g = ndi.gaussian_filter(gray_s.astype(np.float32), 1.0)
-    gx = ndi.sobel(g, axis=1)
-    gy = ndi.sobel(g, axis=0)
-    mag = np.hypot(gx, gy)
-
-    if fgmask.any():
-        mag_vals = mag[fgmask]
-    else:
-        mag_vals = mag.ravel()
-
-    if mag_vals.size == 0:
-        return fgmask
-
-    thr = np.percentile(mag_vals, 78)
-    edges = mag >= thr
-    edges &= fgmask
-    edges = ndi.binary_dilation(edges, iterations=2)
-    hull = ndi.binary_fill_holes(edges)
-    hull = ndi.binary_dilation(hull, iterations=1)
-
-    refined = fgmask | hull
-    refined = ndi.binary_closing(refined, structure=np.ones((3, 3)))
-    refined = ndi.binary_fill_holes(refined)
-    return refined
-
-
-def tight_crop_postcard(img: Image.Image, filename=None, context: Optional[SplitContext] = None):
-    ctx = context or SplitContext(dpi=get_effective_dpi(img), debug=False)
-
-    gray = np.array(img.convert("L"))
-    gray_s = gray[::2, ::2]
-    scale = gray.shape[1] / gray_s.shape[1]
-
-    bgmask_s, dom_mode = _dual_bgmask(gray_s)
-    fgmask = ~bgmask_s
-    fgmask = ndi.binary_fill_holes(fgmask)
-    fgmask = ndi.binary_opening(fgmask, structure=np.ones((3, 3)))
-
-    refined = _edge_refine_mask(gray_s, fgmask)
-
-    comp = _pick_card_component(refined, dpi=ctx.dpi, scale_to_full=scale)
-    if comp is None:
-        comp, _ = _largest_foreground_component(refined)
-
-    if comp is None:
-        return img
-
-    bb = _mask_bbox(comp)
-    if bb is None:
-        return img
-
-    x0, y0, x1, y1 = bb
-    bw, bh = (x1 - x0), (y1 - y0)
-    plausible = plausible_postcard_dims(bw * scale, bh * scale, ctx.dpi)
-
-    if not plausible:
-        comp_fallback, _ = _largest_foreground_component(fgmask)
-        bb_fb = _mask_bbox(comp_fallback) if comp_fallback is not None else None
-        if bb_fb is not None:
-            x0, y0, x1, y1 = bb_fb
-            bw, bh = (x1 - x0), (y1 - y0)
-
-    pad_frac = 0.02 if dom_mode == "white" else 0.008
-    pad_frac = 0.012 if dom_mode not in ("white", "black") else pad_frac
-
-    min_pad = int(np.clip(ctx.dpi / BASE_DPI * 10, 8, 16))
-    pad_x = max(min_pad, int(round(bw * pad_frac)))
-    pad_y = max(min_pad, int(round(bh * pad_frac)))
-
-    x0_full = max(0, int(round(x0 * scale)) - pad_x)
-    y0_full = max(0, int(round(y0 * scale)) - pad_y)
-    x1_full = min(img.width, int(round(x1 * scale)) + pad_x)
-    y1_full = min(img.height, int(round(y1 * scale)) + pad_y)
-
-    if x1_full <= x0_full + 4 or y1_full <= y0_full + 4:
-        return img
-
-    cropped = img.crop((x0_full, y0_full, x1_full, y1_full))
-
-    if ctx.debug:
-        log_debug(
-            filename,
-            "crop",
-            f"mode={dom_mode} pad=({pad_x},{pad_y}) box=({x0_full},{y0_full},{x1_full},{y1_full})"
-        )
-
-    return cropped
 
 
 # ============================================================
@@ -922,12 +809,11 @@ def main():
 
         for idx, p in enumerate(parts, 1):
             deskewed = deskew_postcard(p, scan_path.name, context).image
-            cropped = tight_crop_postcard(deskewed, scan_path.name, context)
             if is_front:
                 fname = f"postcard_{idx}_front.jpg"
             else:
                 fname = f"postcard_{BACK_MIRROR_MAP[idx]}_back.jpg"
-            cropped.save(out_dir / fname, quality=95)
+            deskewed.save(out_dir / fname, quality=95)
 
         print(f"[OK] {scan_path.name}")
 
