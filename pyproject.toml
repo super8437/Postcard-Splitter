@@ -1,0 +1,12 @@
+[project]
+name = "postcard-splitter"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+  "Pillow>=9.0",
+  "numpy>=1.23",
+  "scipy>=1.9",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
