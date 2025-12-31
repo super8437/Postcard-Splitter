@@ -47,6 +47,14 @@ class DeskewResult:
     reason: str
 
 
+@dataclass
+class AngleEstimate:
+    angle: float
+    method: str
+    confidence: float
+    reason: str
+
+
 def _normalize_card_angle(angle: float) -> float:
     """Map any angle to the nearest upright-aligned equivalent in [-45, 45]."""
     return ((angle + 45) % 90) - 45
@@ -176,6 +184,107 @@ def _largest_foreground_component(mask):
     if counts[largest_idx] < 30:
         return None, 0
     return labels == largest_idx, int(counts[largest_idx])
+
+
+def _mask_bbox(mask: np.ndarray):
+    ys, xs = np.nonzero(mask)
+    if ys.size == 0:
+        return None
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    return x0, y0, x1, y1
+
+
+def _border_touch_fraction(mask: np.ndarray) -> float:
+    top = mask[0, :].mean()
+    bot = mask[-1, :].mean()
+    left = mask[:, 0].mean()
+    right = mask[:, -1].mean()
+    return float(max(top, bot, left, right))
+
+
+def _pick_card_component(fg: np.ndarray, dpi: float, scale_to_full: float = 2.0):
+    """
+    Choose a card-like component from a foreground mask.
+    Border-touching components are heavily downweighted (often sleeve/scanner junk).
+    DPI + plausible_postcard_dims is used as a strong prior when available.
+    """
+    labels, n = ndi.label(fg)
+    if n == 0:
+        return None
+
+    H, W = fg.shape
+    cx0, cy0 = (W - 1) / 2.0, (H - 1) / 2.0
+    counts = np.bincount(labels.ravel())
+    counts[0] = 0
+
+    best = None
+    best_score = -1.0
+    for lab in range(1, n + 1):
+        area = float(counts[lab])
+        if area < 0.01 * H * W:
+            continue
+        comp = (labels == lab)
+        bb = _mask_bbox(comp)
+        if bb is None:
+            continue
+        x0, y0, x1, y1 = bb
+        bw, bh = (x1 - x0), (y1 - y0)
+        plausible = plausible_postcard_dims(bw * scale_to_full, bh * scale_to_full, dpi)
+
+        ccx, ccy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+        dist = np.hypot((ccx - cx0) / max(1.0, W), (ccy - cy0) / max(1.0, H))
+
+        score = area
+        if plausible:
+            score *= 3.0
+        touch = _border_touch_fraction(comp)
+        if touch > 0 and not (plausible and area > 0.20 * H * W):
+            penalty = np.interp(touch, [0.02, 0.20, 0.60], [0.95, 0.65, 0.25])
+            score *= penalty
+        score *= 1.0 / (1.0 + 3.0 * dist)
+
+        if score > best_score:
+            best_score = score
+            best = comp
+    return best
+
+
+def _edge_hist_angle(gray_s: np.ndarray, ring: np.ndarray):
+    """
+    Angle from boundary-only gradients (avoids interior texture/text).
+    Returns (angle_deg, confidence) or None.
+    """
+    g = ndi.gaussian_filter(gray_s.astype(np.float32), 1.0)
+    gx = ndi.sobel(g, axis=1)
+    gy = ndi.sobel(g, axis=0)
+    mag = np.hypot(gx, gy)
+    if ring.sum() < 50:
+        return None
+
+    thr = np.percentile(mag[ring], 75)
+    m = ring & (mag >= thr)
+    if m.sum() < 50:
+        return None
+
+    line_theta = np.degrees(np.arctan2(gy[m], gx[m]) + np.pi / 2.0)
+    ang = ((line_theta + 45.0) % 90.0) - 45.0
+    w = mag[m]
+
+    bins = np.arange(-45.0, 45.5, 0.5)
+    hist, edges = np.histogram(ang, bins=bins, weights=w)
+    if hist.sum() <= 0:
+        return None
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    peak_idx = int(np.argmax(hist))
+    peak = float(centers[peak_idx])
+
+    sel = (ang >= peak - 2.0) & (ang <= peak + 2.0)
+    if sel.sum() >= 30:
+        peak = float(np.average(ang[sel], weights=w[sel]))
+
+    conf = float(hist[peak_idx] / (hist.sum() + 1e-9))
+    return peak, conf
 
 
 # ============================================================
@@ -465,83 +574,47 @@ def find_boundary(gray_s, color_s, bgmask, axis, dpi, filename=None, orig_shape=
 # De-skew
 # ============================================================
 
-def _gradient_angle(gray_s: np.ndarray, mask: np.ndarray) -> Tuple[Optional[float], float]:
-    """Return dominant edge angle (degrees) and confidence."""
-    g = ndi.gaussian_filter(gray_s.astype(np.float32), 1.2)
-    gx = ndi.sobel(g, axis=1)
-    gy = ndi.sobel(g, axis=0)
-    mag = np.hypot(gx, gy)
-
-    if not np.any(mask):
-        return None, 0.0
-
-    mag_masked = mag * mask
-    if np.count_nonzero(mask) < 40:
-        return None, 0.0
-
-    thresh = np.percentile(mag_masked[mask], 75)
-    strong = mag_masked >= max(thresh, 1e-3)
-    if np.count_nonzero(strong) < 20:
-        return None, 0.0
-
-    theta = np.rad2deg(np.arctan2(gy, gx))
-    theta = ((theta + 90) % 180) - 90  # fold to [-90, 90]
-
-    angles = theta[strong]
-    weights = mag_masked[strong]
-
-    bins = np.linspace(-90, 90, 181)
-    hist, edges = np.histogram(angles, bins=bins, weights=weights)
-    centers = (edges[:-1] + edges[1:]) / 2
-
-    peak_idx = int(np.argmax(hist))
-    peak_angle = centers[peak_idx]
-    confidence = float(hist[peak_idx] / (weights.sum() + 1e-6))
-
-    return _normalize_card_angle(float(peak_angle)), confidence
-
-
-def estimate_card_angle(gray_s: np.ndarray) -> Tuple[float, str]:
-    """Estimate the dominant axis angle (degrees) of the postcard."""
-    if min(gray_s.shape) < 20:
-        return 0.0, "too-small"
+def estimate_card_angle(gray_s: np.ndarray, dpi: Optional[float] = None) -> AngleEstimate:
+    """
+    Return a correction angle in degrees (feed directly to PIL.Image.rotate)
+    plus metadata for logging/decisioning.
+    """
+    dpi = dpi or BASE_DPI
+    if min(gray_s.shape) < 40:
+        return AngleEstimate(0.0, "pca", 0.0, "too-small")
 
     bgmask = build_bgmask(gray_s)
     fg = ndi.binary_fill_holes(~bgmask)
+    fg = ndi.binary_opening(fg, structure=np.ones((3, 3)))
 
-    largest, area = _largest_foreground_component(fg)
-    if largest is None:
-        return 0.0, "no-foreground"
+    card = _pick_card_component(fg, dpi=dpi, scale_to_full=2.0)
+    if card is None:
+        return AngleEstimate(0.0, "pca", 0.0, "no-card-component")
 
-    coords = np.column_stack(np.nonzero(largest))
-    if coords.shape[0] < 40:
-        return 0.0, "insufficient-foreground"
+    ring = card & ~ndi.binary_erosion(card, structure=np.ones((5, 5)))
+
+    coords = np.column_stack(np.nonzero(ring))
+    if coords.shape[0] < 80:
+        return AngleEstimate(0.0, "pca", 0.0, "insufficient-edge")
 
     coords_centered = coords - coords.mean(axis=0)
     cov = np.cov(coords_centered, rowvar=False)
     evals, evecs = np.linalg.eigh(cov)
     principal = evecs[:, np.argmax(evals)]
+    pca_angle = _normalize_card_angle(float(np.degrees(np.arctan2(principal[0], principal[1]))))
 
-    angle_rad = np.arctan2(principal[0], principal[1])
-    angle_deg = np.rad2deg(angle_rad)
+    eh = _edge_hist_angle(gray_s, ring)
+    if eh is not None:
+        ang, conf = eh
+        if conf >= 0.25:
+            return AngleEstimate(float(ang), "edge-hist", float(conf), "edge-hist")
+        if conf >= 0.18:
+            blend = min(0.5, max(0.0, (conf - 0.18) / 0.07) * 0.5)
+            blended = _normalize_card_angle(float((1 - blend) * pca_angle + blend * ang))
+            return AngleEstimate(blended, "edge-blend", float(conf), "edge-blend")
+        return AngleEstimate(float(pca_angle), "pca", float(conf), "edge-lowconf")
 
-    upright_angle = _normalize_card_angle(float(angle_deg))
-
-    grad_angle, grad_conf = _gradient_angle(gray_s, largest)
-    pca_conf = min(1.0, coords.shape[0] / (area + 1e-6))
-
-    if grad_angle is not None and (grad_conf >= 0.12 or pca_conf < 0.05):
-        chosen = grad_angle
-        reason = f"edge:{grad_conf:.3f}"
-    elif grad_angle is not None:
-        blend = min(0.6, grad_conf * 2.5)
-        chosen = (1 - blend) * upright_angle + blend * grad_angle
-        reason = f"blend:{blend:.3f}"
-    else:
-        chosen = upright_angle
-        reason = f"pca:{pca_conf:.3f}"
-
-    return float(_normalize_card_angle(chosen)), reason
+    return AngleEstimate(float(pca_angle), "pca", 0.0, "pca-fallback")
 
 
 def deskew_postcard(img: Image.Image, filename=None, context: Optional[SplitContext] = None) -> DeskewResult:
@@ -549,20 +622,44 @@ def deskew_postcard(img: Image.Image, filename=None, context: Optional[SplitCont
 
     gray = np.array(img.convert("L"))
     gray_s = gray[::2, ::2]
-    angle, reason = estimate_card_angle(gray_s)
-    if abs(angle) < 0.15:
-        return DeskewResult(img, 0.0, reason)
+    est = estimate_card_angle(gray_s, dpi=ctx.dpi)
+
+    base_thresh = 0.35
+    if est.method in ("edge-hist", "edge-blend"):
+        if est.confidence >= 0.25:
+            thresh = 0.20
+        elif est.confidence >= 0.18:
+            thresh = 0.28
+        else:
+            thresh = base_thresh
+    else:
+        thresh = base_thresh
+
+    if abs(est.angle) < thresh:
+        return DeskewResult(img, 0.0, est.reason)
+
+    angle = float(np.clip(est.angle, -20.0, 20.0))
 
     fill = pick_fill_color(gray_s)
     fill_rgb = (fill, fill, fill) if img.mode != "L" else fill
-    applied = float(np.clip(angle, -30.0, 30.0))
-    reason_out = reason if applied == angle else f"{reason}|clamped"
-    rotated = img.rotate(applied, resample=Image.BICUBIC, expand=True, fillcolor=fill_rgb)
+    rotated = img.rotate(angle, resample=Image.BICUBIC, expand=True, fillcolor=fill_rgb)
+
+    rot_gray_s = np.array(rotated.convert("L"))[::2, ::2]
+    est2 = estimate_card_angle(rot_gray_s, dpi=ctx.dpi)
+    valid2 = (
+        est2.reason not in {"too-small", "no-card-component", "insufficient-edge"} and
+        ((est2.method in {"edge-hist", "edge-blend"} and est2.confidence >= 0.18))
+    )
+    before = abs(angle)
+    after = abs(est2.angle)
+    improved = after <= 0.65 * before and (before - after) >= 0.15
+    if not valid2 or not improved:
+        return DeskewResult(img, 0.0, est.reason + " | reverted: sanity-check")
 
     if ctx.debug:
-        log_debug(filename, "deskew", f"angle={angle:.2f} applied={applied:.2f} reason={reason_out}")
+        log_debug(filename, "deskew", f"method={est.method} conf={est.confidence:.2f} angle={angle:.2f}")
 
-    return DeskewResult(rotated, applied, reason_out)
+    return DeskewResult(rotated, angle, est.reason)
 
 
 # ============================================================
