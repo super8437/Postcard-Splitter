@@ -2,6 +2,11 @@ import numpy as np
 
 from postcard_split.cv2_bridge import require_cv2
 
+# === Postcard geometry (physical, scaled by DPI) ===
+BASE_DPI = 200
+LONG_SIDE_RANGE_IN = (5.0, 6.5)
+SHORT_SIDE_RANGE_IN = (3.0, 4.5)
+
 __all__ = [
     "require_cv2",
     "bgmask_cv2",
@@ -11,6 +16,9 @@ __all__ = [
     "thresholds_from_border",
     "fill_holes_cv2",
     "debug_save_mask",
+    "plausible_postcard_dims",
+    "find_postcard_rect_cv2",
+    "rect_to_safe_aabb",
 ]
 
 
@@ -54,6 +62,21 @@ def thresholds_from_border(bg_mode, border):
         "WHITE_GROW_T": int(np.clip(np.percentile(border, 40) - 8, 190, 235)),
         "BLACK_T": int(np.clip(np.percentile(border, 50) + 10, 25, 150)),
     }
+
+
+def plausible_postcard_dims(card_w, card_h, dpi):
+    long_min = LONG_SIDE_RANGE_IN[0] * dpi
+    long_max = LONG_SIDE_RANGE_IN[1] * dpi
+    short_min = SHORT_SIDE_RANGE_IN[0] * dpi
+    short_max = SHORT_SIDE_RANGE_IN[1] * dpi
+
+    long_side = max(card_w, card_h)
+    short_side = min(card_w, card_h)
+
+    return (
+        short_min <= short_side <= short_max and
+        long_min <= long_side <= long_max
+    )
 
 
 def _binary_close_border_true(mask_u8: np.ndarray, ksize: int = 5) -> np.ndarray:
@@ -200,11 +223,98 @@ def debug_save_mask(mask_bool: np.ndarray, out_path: str) -> None:
     cv2.imwrite(out_path, mask_u8)
 
 
+def find_postcard_rect_cv2(gray: np.ndarray, dpi: float) -> dict | None:
+    """
+    Locate a robust postcard-like rectangle using contour detection and cv2.minAreaRect.
+    Returns a dictionary with rect info or None if no plausible contour is found.
+    """
+    cv2 = require_cv2()
+    if gray.dtype != np.uint8 or gray.ndim != 2:
+        raise ValueError("find_postcard_rect_cv2 expects a uint8 grayscale image.")
+
+    bg = bgmask_cv2(gray)
+    fg = np.logical_not(bg)
+    fg = clean_fgmask_cv2(fg)
+
+    fg_u8 = np.ascontiguousarray(np.where(fg, 255, 0).astype(np.uint8, copy=False))
+    contours_info = cv2.findContours(fg_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if len(contours_info) == 3:
+        _, contours, _ = contours_info
+    else:
+        contours, _ = contours_info
+
+    if not contours:
+        return None
+
+    H, W = gray.shape
+    min_area = max(50.0, 0.002 * H * W)
+
+    best = None
+    for idx, contour in enumerate(contours):
+        area = float(cv2.contourArea(contour))
+        if area < min_area:
+            continue
+
+        rect = cv2.minAreaRect(contour)
+        (_, _), (rw, rh), angle = rect
+        plausible = bool(plausible_postcard_dims(rw, rh, dpi) or plausible_postcard_dims(rh, rw, dpi))
+
+        x, y, bw, bh = cv2.boundingRect(contour)
+        # Use inclusive low edges and an exclusive-ish high edge to flag AABBs that graze the border.
+        touches_border = (x <= 1) or (y <= 1) or (x + bw >= W - 1) or (y + bh >= H - 1)
+
+        score = area
+        if plausible:
+            score *= 1.4
+        if touches_border:
+            score *= 0.6
+
+        if best is None or score > best["score"]:
+            box_points = cv2.boxPoints(rect)
+            best = {
+                "rect": rect,
+                "contour_area": area,
+                "contour_idx": idx,
+                "plausible": plausible,
+                "touches_border": touches_border,
+                "score": score,
+                "box_points": box_points,
+                "angle": angle,
+                "bounding_rect": (x, y, bw, bh),
+            }
+
+    return best
+
+
+def rect_to_safe_aabb(rect, W: int, H: int, pad_px: float = 0.0) -> tuple[int, int, int, int]:
+    """Return a padded, clamped axis-aligned bounding box around a rotated rect."""
+    cv2 = require_cv2()
+    pts = cv2.boxPoints(rect)
+    xs = pts[:, 0]
+    ys = pts[:, 1]
+
+    x0 = float(np.min(xs)) - pad_px
+    y0 = float(np.min(ys)) - pad_px
+    x1 = float(np.max(xs)) + pad_px
+    y1 = float(np.max(ys)) + pad_px
+
+    x0_i = int(np.clip(np.floor(x0), 0, max(0, W - 1)))
+    y0_i = int(np.clip(np.floor(y0), 0, max(0, H - 1)))
+    x1_i = int(np.clip(np.ceil(x1), 0, W))
+    y1_i = int(np.clip(np.ceil(y1), 0, H))
+
+    if x1_i <= x0_i:
+        x1_i = min(W, x0_i + 1)
+    if y1_i <= y0_i:
+        y1_i = min(H, y0_i + 1)
+    return x0_i, y0_i, x1_i, y1_i
+
+
 if __name__ == "__main__":
     # Minimal smoke test for manual inspection.
     import argparse
 
-    parser = argparse.ArgumentParser(description="Generate a background mask preview using cv2 flood fill.")
+    parser = argparse.ArgumentParser(description="Preview background mask and contour-based rectangle utilities.")
     parser.add_argument("input", help="Path to a grayscale image")
     parser.add_argument("output", help="Path to save the background mask PNG")
     args = parser.parse_args()
