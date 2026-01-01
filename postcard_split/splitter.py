@@ -758,6 +758,11 @@ def main():
         help="Run a no-op OpenCV roundtrip before saving (requires opencv-python-headless).",
     )
     parser.add_argument(
+        "--tight-crop",
+        action="store_true",
+        help="Attempt a conservative cv2-based crop after deskewing (fails safe).",
+    )
+    parser.add_argument(
         "inputs",
         nargs="+",
         help="Image files or directories containing scans.",
@@ -816,6 +821,14 @@ def main():
 
         for idx, p in enumerate(parts, 1):
             deskewed = deskew_postcard(p, scan_path.name, context).image
+            if args.tight_crop:
+                from postcard_split import cv2_crop
+                deskewed = cv2_crop.tight_crop_postcard_cv2(
+                    deskewed,
+                    dpi=context.dpi,
+                    debug=context.debug,
+                    debug_dir=out_dir / "_debug",
+                )
             if args.use_cv2:
                 cv2 = cv2_bridge.require_cv2()
                 bgr = cv2_bridge.pil_to_bgr(deskewed)

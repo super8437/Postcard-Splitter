@@ -1,4 +1,7 @@
+from pathlib import Path
+
 import numpy as np
+from PIL import Image
 
 from postcard_split.cv2_bridge import require_cv2
 
@@ -19,6 +22,7 @@ __all__ = [
     "plausible_postcard_dims",
     "find_postcard_rect_cv2",
     "rect_to_safe_aabb",
+    "tight_crop_postcard_cv2",
 ]
 
 
@@ -308,6 +312,71 @@ def rect_to_safe_aabb(rect, W: int, H: int, pad_px: float = 0.0) -> tuple[int, i
     if y1_i <= y0_i:
         y1_i = min(H, y0_i + 1)
     return x0_i, y0_i, x1_i, y1_i
+
+
+def _debug_save_masks_and_overlay(
+    debug_dir: Path,
+    gray: np.ndarray,
+    bgmask: np.ndarray,
+    fgmask: np.ndarray,
+    rect_info: dict,
+    crop_box: tuple[int, int, int, int],
+) -> None:
+    cv2 = require_cv2()
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    bgmask_u8 = np.where(bgmask, 255, 0).astype(np.uint8, copy=False)
+    fgmask_u8 = np.where(fgmask, 255, 0).astype(np.uint8, copy=False)
+    cv2.imwrite(str(debug_dir / "tight_crop_bgmask.png"), bgmask_u8)
+    cv2.imwrite(str(debug_dir / "tight_crop_fgmask.png"), fgmask_u8)
+
+    overlay = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    box_pts = rect_info.get("box_points")
+    if box_pts is None:
+        box_pts = cv2.boxPoints(rect_info["rect"])
+    box_pts_i = np.intp(box_pts)
+    cv2.drawContours(overlay, [box_pts_i], -1, (0, 255, 0), 2)
+    x0, y0, x1, y1 = crop_box
+    cv2.rectangle(overlay, (x0, y0), (x1 - 1, y1 - 1), (0, 0, 255), 2)
+    cv2.imwrite(str(debug_dir / "tight_crop_overlay.png"), overlay)
+
+
+def tight_crop_postcard_cv2(
+    img_pil: Image.Image,
+    dpi: float,
+    debug: bool = False,
+    debug_dir: Path | None = None,
+) -> Image.Image:
+    """
+    Attempt a conservative tight crop around a detected postcard rectangle.
+
+    If detection fails or the crop is implausibly small, the original image is returned.
+    """
+    try:
+        gray = np.array(img_pil.convert("L"), dtype=np.uint8, copy=False)
+        H, W = gray.shape
+
+        rect_info = find_postcard_rect_cv2(gray, dpi)
+        if rect_info is None:
+            return img_pil
+
+        pad_px = max(12, int(0.01 * min(W, H)))
+        crop_box = rect_to_safe_aabb(rect_info["rect"], W, H, pad_px)
+        x0, y0, x1, y1 = crop_box
+
+        crop_area = (x1 - x0) * (y1 - y0)
+        if crop_area < 0.5 * W * H:
+            return img_pil
+
+        if debug or debug_dir:
+            bgmask = bgmask_cv2(gray)
+            fgmask = clean_fgmask_cv2(np.logical_not(bgmask))
+            if debug_dir is not None:
+                _debug_save_masks_and_overlay(debug_dir, gray, bgmask, fgmask, rect_info, crop_box)
+
+        return img_pil.crop((x0, y0, x1, y1))
+    except Exception:
+        return img_pil
 
 
 if __name__ == "__main__":
