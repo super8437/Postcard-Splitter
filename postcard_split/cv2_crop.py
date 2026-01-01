@@ -2,7 +2,16 @@ import numpy as np
 
 from postcard_split.cv2_bridge import require_cv2
 
-__all__ = ["require_cv2", "bgmask_cv2", "debug_save_bgmask", "classify_background", "thresholds_from_border"]
+__all__ = [
+    "require_cv2",
+    "bgmask_cv2",
+    "clean_fgmask_cv2",
+    "debug_save_bgmask",
+    "classify_background",
+    "thresholds_from_border",
+    "fill_holes_cv2",
+    "debug_save_mask",
+]
 
 
 def classify_background(gray_s):
@@ -141,6 +150,54 @@ def debug_save_bgmask(gray: np.ndarray, bgmask: np.ndarray, out_path: str) -> No
     cv2 = require_cv2()
     overlay = np.where(bgmask, 255, 0).astype(np.uint8, copy=False)
     cv2.imwrite(out_path, overlay)
+
+
+def clean_fgmask_cv2(fgmask_bool: np.ndarray) -> np.ndarray:
+    cv2 = require_cv2()
+    if fgmask_bool.dtype != bool or fgmask_bool.ndim != 2:
+        raise ValueError("clean_fgmask_cv2 expects a 2D boolean mask.")
+
+    fg_u8 = np.ascontiguousarray(np.where(fgmask_bool, 255, 0).astype(np.uint8, copy=False))
+
+    close_kernel = np.ones((7, 7), dtype=np.uint8)
+    open_kernel = np.ones((5, 5), dtype=np.uint8)
+
+    closed = cv2.morphologyEx(fg_u8, cv2.MORPH_CLOSE, close_kernel)
+    opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, open_kernel)
+    return opened > 0
+
+
+def fill_holes_cv2(fgmask_bool: np.ndarray) -> np.ndarray:
+    cv2 = require_cv2()
+    if fgmask_bool.dtype != bool or fgmask_bool.ndim != 2:
+        raise ValueError("fill_holes_cv2 expects a 2D boolean mask.")
+
+    inv = np.logical_not(fgmask_bool)
+    inv_u8 = np.ascontiguousarray(np.where(inv, 255, 0).astype(np.uint8, copy=False))
+
+    seeds = _border_seeds(inv)
+    if not seeds:
+        return fgmask_bool.copy()
+
+    fill_img = np.ascontiguousarray(inv_u8)
+    mask = np.zeros((inv_u8.shape[0] + 2, inv_u8.shape[1] + 2), dtype=np.uint8)
+
+    for sx, sy in seeds:
+        if fill_img[sy, sx] != 255:
+            continue
+        cv2.floodFill(fill_img, mask, (int(sx), int(sy)), 128, loDiff=0, upDiff=0, flags=4)
+
+    holes = (fill_img == 255) & inv
+    if not np.any(holes):
+        return fgmask_bool
+
+    return np.logical_or(fgmask_bool, holes)
+
+
+def debug_save_mask(mask_bool: np.ndarray, out_path: str) -> None:
+    cv2 = require_cv2()
+    mask_u8 = np.ascontiguousarray(np.where(mask_bool, 255, 0).astype(np.uint8, copy=False))
+    cv2.imwrite(out_path, mask_u8)
 
 
 if __name__ == "__main__":
