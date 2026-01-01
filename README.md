@@ -2,6 +2,18 @@
 
 Split a flatbed scan that contains a 2x2 grid of postcards into four cropped images.
 
+### Installation
+
+Install the project (and its dependencies like Pillow, NumPy, and SciPy) with pip:
+
+```bash
+python -m pip install -r requirements.txt
+# or
+python -m pip install .
+```
+
+If your system lacks image codecs needed by Pillow, prefer the prebuilt wheels (`pip install --upgrade pip setuptools wheel`) before installing to avoid build issues.
+
 ### Usage
 
 ```bash
