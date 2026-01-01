@@ -8,6 +8,8 @@ import numpy as np
 import scipy.ndimage as ndi
 from PIL import Image
 
+import postcard_split.cv2_bridge as cv2_bridge
+
 # === Postcard geometry (physical, scaled by DPI) ===
 BASE_DPI = 200
 LONG_SIDE_RANGE_IN = (5.0, 6.5)
@@ -751,6 +753,11 @@ def main():
         help="Enable verbose seam detection logging.",
     )
     parser.add_argument(
+        "--use-cv2",
+        action="store_true",
+        help="Run a no-op OpenCV roundtrip before saving (requires opencv-python-headless).",
+    )
+    parser.add_argument(
         "inputs",
         nargs="+",
         help="Image files or directories containing scans.",
@@ -809,6 +816,12 @@ def main():
 
         for idx, p in enumerate(parts, 1):
             deskewed = deskew_postcard(p, scan_path.name, context).image
+            if args.use_cv2:
+                cv2 = cv2_bridge.require_cv2()
+                bgr = cv2_bridge.pil_to_bgr(deskewed)
+                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                bgr2 = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+                deskewed = cv2_bridge.bgr_to_pil(bgr2)
             if is_front:
                 fname = f"postcard_{idx}_front.jpg"
             else:
