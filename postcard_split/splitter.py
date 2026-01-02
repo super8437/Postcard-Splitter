@@ -820,21 +820,28 @@ def main():
             print(f"WARNING: {scan_path.name} produced {len(parts)} parts")
 
         for idx, p in enumerate(parts, 1):
+            if is_front:
+                stem = f"postcard_{idx}_front"
+            else:
+                stem = f"postcard_{BACK_MIRROR_MAP[idx]}_back"
+
+            debug_dir = None
+            if args.tight_crop:
+                debug_dir = out_dir / "_debug" / stem
+                debug_dir.mkdir(parents=True, exist_ok=True)
+                p.save(debug_dir / "stage0_split.png")
+
             deskewed = deskew_postcard(p, scan_path.name, context).image
             if args.tight_crop:
                 from postcard_split import cv2_crop
 
-                # use the same naming scheme as the output file so debug dirs match outputs
-                if is_front:
-                    debug_tag = f"postcard_{idx}_front"
-                else:
-                    debug_tag = f"postcard_{BACK_MIRROR_MAP[idx]}_back"
-
+                if debug_dir is not None:
+                    deskewed.save(debug_dir / "stage1_deskew.png")
                 deskewed = cv2_crop.tight_crop_postcard_cv2(
                     deskewed,
                     dpi=context.dpi,
                     debug=context.debug,
-                    debug_dir=out_dir / "_debug" / debug_tag,
+                    debug_dir=debug_dir,
                 )
 
             if args.use_cv2:
@@ -843,10 +850,8 @@ def main():
                 rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
                 bgr2 = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
                 deskewed = cv2_bridge.bgr_to_pil(bgr2)
-            if is_front:
-                fname = f"postcard_{idx}_front.jpg"
-            else:
-                fname = f"postcard_{BACK_MIRROR_MAP[idx]}_back.jpg"
+
+            fname = f"{stem}.jpg"
             deskewed.save(out_dir / fname, quality=95)
 
         print(f"[OK] {scan_path.name}")

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import numpy as np
@@ -319,8 +320,8 @@ def _debug_save_masks_and_overlay(
     gray: np.ndarray,
     bgmask: np.ndarray,
     fgmask: np.ndarray,
-    rect_info: dict,
-    crop_box: tuple[int, int, int, int],
+    rect_info: dict | None,
+    crop_box: tuple[int, int, int, int] | None,
 ) -> None:
     cv2 = require_cv2()
     debug_dir.mkdir(parents=True, exist_ok=True)
@@ -331,14 +332,59 @@ def _debug_save_masks_and_overlay(
     cv2.imwrite(str(debug_dir / "tight_crop_fgmask.png"), fgmask_u8)
 
     overlay = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-    box_pts = rect_info.get("box_points")
-    if box_pts is None:
-        box_pts = cv2.boxPoints(rect_info["rect"])
-    box_pts_i = np.intp(box_pts)
-    cv2.drawContours(overlay, [box_pts_i], -1, (0, 255, 0), 2)
-    x0, y0, x1, y1 = crop_box
-    cv2.rectangle(overlay, (x0, y0), (x1 - 1, y1 - 1), (0, 0, 255), 2)
+    box_pts = None
+    if rect_info is not None:
+        box_pts = rect_info.get("box_points")
+        if box_pts is None and rect_info.get("rect") is not None:
+            box_pts = cv2.boxPoints(rect_info["rect"])
+    if box_pts is not None:
+        box_pts_i = np.intp(box_pts)
+        cv2.drawContours(overlay, [box_pts_i], -1, (0, 255, 0), 2)
+    if crop_box is not None:
+        x0, y0, x1, y1 = crop_box
+        cv2.rectangle(overlay, (x0, y0), (x1 - 1, y1 - 1), (0, 0, 255), 2)
     cv2.imwrite(str(debug_dir / "tight_crop_overlay.png"), overlay)
+
+
+def _write_rect_json(
+    debug_dir: Path,
+    status: str,
+    dpi: float,
+    W: int,
+    H: int,
+    pad_px: int | None,
+    crop_box: tuple[int, int, int, int] | None,
+    crop_area_ratio: float | None,
+    rect_info: dict | None,
+) -> None:
+    data: dict[str, object] = {
+        "status": status,
+        "dpi": float(dpi),
+        "W": int(W),
+        "H": int(H),
+        "pad_px": int(pad_px) if pad_px is not None else None,
+        "crop_box": [int(v) for v in crop_box] if crop_box is not None else None,
+        "crop_area_ratio": float(crop_area_ratio) if crop_area_ratio is not None else None,
+    }
+
+    if rect_info:
+        rect = rect_info.get("rect")
+        if rect is not None:
+            (cx, cy), (rw, rh), angle = rect
+            data["rect"] = [[float(cx), float(cy)], [float(rw), float(rh)], float(angle)]
+        box_points = rect_info.get("box_points")
+        if box_points is not None:
+            data["box_points"] = np.asarray(box_points).tolist()
+        if "contour_area" in rect_info:
+            data["contour_area"] = float(rect_info["contour_area"])
+        if "score" in rect_info:
+            data["score"] = float(rect_info["score"])
+        if "plausible" in rect_info:
+            data["plausible"] = bool(rect_info["plausible"])
+        if "touches_border" in rect_info:
+            data["touches_border"] = bool(rect_info["touches_border"])
+
+    (debug_dir / "tight_crop_rect_info.json").write_text(json.dumps(data, indent=2))
 
 
 def tight_crop_postcard_cv2(
@@ -352,30 +398,97 @@ def tight_crop_postcard_cv2(
 
     If detection fails or the crop is implausibly small, the original image is returned.
     """
+    debug_dir_path = Path(debug_dir) if debug_dir is not None else None
+
     try:
         gray = np.array(img_pil.convert("L"), dtype=np.uint8, copy=False)
         H, W = gray.shape
 
+        if debug_dir_path is not None:
+            debug_dir_path.mkdir(parents=True, exist_ok=True)
+            img_pil.convert("RGB").save(debug_dir_path / "stage1_input.png")
+            Image.fromarray(gray).save(debug_dir_path / "stage1_input_gray.png")
+
         rect_info = find_postcard_rect_cv2(gray, dpi)
+        pad_px = max(12, int(0.01 * min(W, H)))
+
+        bgmask = None
+        fgmask = None
+
+        def ensure_masks() -> None:
+            nonlocal bgmask, fgmask
+            if bgmask is None or fgmask is None:
+                bgmask = bgmask_cv2(gray)
+                fgmask = clean_fgmask_cv2(np.logical_not(bgmask))
+
         if rect_info is None:
+            if debug or debug_dir_path is not None:
+                ensure_masks()
+                if debug_dir_path is not None:
+                    _debug_save_masks_and_overlay(debug_dir_path, gray, bgmask, fgmask, None, None)
+                    _write_rect_json(
+                        debug_dir_path,
+                        status="no_rect",
+                        dpi=dpi,
+                        W=W,
+                        H=H,
+                        pad_px=pad_px,
+                        crop_box=None,
+                        crop_area_ratio=None,
+                        rect_info=None,
+                    )
             return img_pil
 
-        pad_px = max(12, int(0.01 * min(W, H)))
         crop_box = rect_to_safe_aabb(rect_info["rect"], W, H, pad_px)
         x0, y0, x1, y1 = crop_box
 
         crop_area = (x1 - x0) * (y1 - y0)
+        crop_area_ratio = crop_area / (W * H) if (W * H) else 0.0
         if crop_area < 0.5 * W * H:
+            if debug or debug_dir_path is not None:
+                ensure_masks()
+                if debug_dir_path is not None:
+                    _debug_save_masks_and_overlay(debug_dir_path, gray, bgmask, fgmask, rect_info, crop_box)
+                    _write_rect_json(
+                        debug_dir_path,
+                        status="reject_small_crop",
+                        dpi=dpi,
+                        W=W,
+                        H=H,
+                        pad_px=pad_px,
+                        crop_box=crop_box,
+                        crop_area_ratio=crop_area_ratio,
+                        rect_info=rect_info,
+                    )
             return img_pil
 
         if debug or debug_dir:
-            bgmask = bgmask_cv2(gray)
-            fgmask = clean_fgmask_cv2(np.logical_not(bgmask))
-            if debug_dir is not None:
-                _debug_save_masks_and_overlay(debug_dir, gray, bgmask, fgmask, rect_info, crop_box)
+            ensure_masks()
+            if debug_dir_path is not None:
+                _debug_save_masks_and_overlay(debug_dir_path, gray, bgmask, fgmask, rect_info, crop_box)
+                _write_rect_json(
+                    debug_dir_path,
+                    status="ok",
+                    dpi=dpi,
+                    W=W,
+                    H=H,
+                    pad_px=pad_px,
+                    crop_box=crop_box,
+                    crop_area_ratio=crop_area_ratio,
+                    rect_info=rect_info,
+                )
 
-        return img_pil.crop((x0, y0, x1, y1))
-    except Exception:
+        cropped = img_pil.crop((x0, y0, x1, y1))
+        if debug_dir_path is not None:
+            cropped.save(debug_dir_path / "stage2_tightcrop.png")
+        return cropped
+    except Exception as e:
+        if debug_dir_path is not None:
+            try:
+                debug_dir_path.mkdir(parents=True, exist_ok=True)
+                (debug_dir_path / "tight_crop_error.txt").write_text(repr(e))
+            except Exception:
+                pass
         return img_pil
 
 
