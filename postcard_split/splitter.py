@@ -823,12 +823,20 @@ def main():
             deskewed = deskew_postcard(p, scan_path.name, context).image
             if args.tight_crop:
                 from postcard_split import cv2_crop
+
+                # use the same naming scheme as the output file so debug dirs match outputs
+                if is_front:
+                    debug_tag = f"postcard_{idx}_front"
+                else:
+                    debug_tag = f"postcard_{BACK_MIRROR_MAP[idx]}_back"
+
                 deskewed = cv2_crop.tight_crop_postcard_cv2(
                     deskewed,
                     dpi=context.dpi,
                     debug=context.debug,
-                    debug_dir=out_dir / "_debug",
+                    debug_dir=out_dir / "_debug" / debug_tag,
                 )
+
             if args.use_cv2:
                 cv2 = cv2_bridge.require_cv2()
                 bgr = cv2_bridge.pil_to_bgr(deskewed)
