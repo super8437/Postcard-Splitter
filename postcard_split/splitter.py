@@ -27,6 +27,7 @@ INK_THRESHOLD = 190
 class SplitContext:
     dpi: float
     debug: bool
+    safer_seams: bool = False
 
     @property
     def dpi_scale(self):
@@ -763,7 +764,8 @@ def split_once(
 
     W, H = img.size
     color = np.array(img.convert("RGB"))
-    gray = np.array(img.convert("L"))
+    gray_orig = np.array(img.convert("L"))
+    gray = gray_orig
 
     if axis == "horizontal":
         color = color.transpose(1, 0, 2)
@@ -854,7 +856,85 @@ def split_once(
             debug_out.setdefault("chosen_split", int(split_s))
             debug_out.setdefault("chosen_stage", stage_used)
             debug_out.setdefault("chosen_confidence", seam_result.confidence)
-    overlap = max(16, int(0.01 * gray.shape[1]))
+    axis_length = gray_orig.shape[1] if axis == "vertical" else gray_orig.shape[0]
+    overlap = max(16, int(0.01 * axis_length))
+
+    if ctx.safer_seams:
+        band = (
+            gray_orig[:, max(0, split - 3):min(W, split + 3)]
+            if axis == "vertical" else
+            gray_orig[max(0, split - 3):min(H, split + 3), :]
+        )
+        ink_ratio_band = float(np.mean(band < INK_THRESHOLD)) if band.size else 0.0
+        seam_risky = ink_ratio_band > 0.20
+        shifted = False
+        shift_amount = 0
+        best_split = split
+        best_ink_ratio = ink_ratio_band
+        best_bg_ratio: Optional[float] = None
+        search_radius = max(8, int(40 * ctx.dpi_scale))
+        if seam_risky or stage_used == "FORCED_FALLBACK":
+            step = max(1, int(max(1.0, scale // 2)))
+            start = max(0, split - search_radius)
+            end = min(axis_length - 1, split + search_radius)
+            for cand in range(start, end + 1, step):
+                if cand == split:
+                    continue
+                cand_band = (
+                    gray_orig[:, max(0, cand - 3):min(W, cand + 3)]
+                    if axis == "vertical" else
+                    gray_orig[max(0, cand - 3):min(H, cand + 3), :]
+                )
+                cand_ink_ratio = float(np.mean(cand_band < INK_THRESHOLD)) if cand_band.size else 0.0
+
+                cand_split_s = int(round(cand / scale))
+                cand_bg_ratio = None
+                try:
+                    band_slice = slice(max(0, cand_split_s - 3), min(bgmask.shape[1], cand_split_s + 3))
+                    bg_band = bgmask[:, band_slice]
+                    cand_bg_ratio = float(np.mean(bg_band)) if bg_band.size else None
+                except Exception:
+                    cand_bg_ratio = None
+
+                better_ink = cand_ink_ratio + 1e-6 < best_ink_ratio - 0.01
+                better_bg = (
+                    cand_bg_ratio is not None and
+                    (best_bg_ratio is None or cand_bg_ratio > best_bg_ratio + 0.05)
+                )
+                if better_ink or (abs(cand_ink_ratio - best_ink_ratio) < 0.005 and better_bg):
+                    best_split = cand
+                    best_ink_ratio = cand_ink_ratio
+                    best_bg_ratio = cand_bg_ratio
+
+            meaningful_improvement = best_split != split and (best_ink_ratio < ink_ratio_band - 0.02)
+            if meaningful_improvement:
+                shift_amount = best_split - split
+                split = best_split
+                shifted = True
+
+        if seam_risky or stage_used == "FORCED_FALLBACK":
+            target_overlap = max(overlap, int(0.03 * axis_length))
+            max_overlap = int(0.10 * axis_length)
+            overlap = int(min(max_overlap, target_overlap))
+
+        safer_meta = {
+            "enabled": True,
+            "ink_ratio_band": float(ink_ratio_band),
+            "best_ink_ratio": float(best_ink_ratio),
+            "best_bg_ratio": float(best_bg_ratio) if best_bg_ratio is not None else None,
+            "shift_amount": int(shift_amount),
+            "final_overlap": int(overlap),
+            "stage_used": stage_used,
+        }
+        if debug_out is not None:
+            debug_out["safer_seams"] = safer_meta
+
+        if ctx.debug:
+            log_debug(
+                filename,
+                axis,
+                f"safer-seams: risk={ink_ratio_band:.3f} shifted={shift_amount} overlap={overlap}"
+            )
 
     if ctx.debug:
         log_debug(
@@ -946,6 +1026,11 @@ def main():
         help="Enable verbose seam detection logging.",
     )
     parser.add_argument(
+        "--safer-seams",
+        action="store_true",
+        help="Enable conservative seam guardrails to reduce postcard trimming.",
+    )
+    parser.add_argument(
         "--debug-seam-images",
         action="store_true",
         help="Write seam debug artifacts (images + metadata).",
@@ -996,6 +1081,7 @@ def main():
         context = SplitContext(
             dpi=get_effective_dpi(img),
             debug=DEBUG_SEAMS,
+            safer_seams=args.safer_seams,
         )
         if DEBUG_SEAMS:
             log_debug(
