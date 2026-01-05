@@ -435,9 +435,18 @@ def detect_card_boxes(gray_s, bgmask, axis, dpi, filename=None):
     return (gap_start + gap_end) // 2
 
 
-def find_boundary(gray_s, color_s, bgmask, axis, dpi, filename=None, orig_shape=None):
+def find_boundary(gray_s, color_s, bgmask, axis, dpi, filename=None, orig_shape=None, debug_out: dict | None = None):
     Hs, Ws = gray_s.shape
     if Hs < 40 or Ws < 40:
+        if debug_out is not None:
+            debug_out["Hs"] = int(Hs)
+            debug_out["Ws"] = int(Ws)
+            debug_out["axis"] = axis
+            debug_out["dpi"] = float(dpi)
+            debug_out["reason"] = "geometry-too-small"
+            debug_out["chosen_split"] = None
+            debug_out["chosen_stage"] = None
+            debug_out["chosen_confidence"] = None
         return None, "geometry-too-small"
 
     log_debug(
@@ -449,6 +458,16 @@ def find_boundary(gray_s, color_s, bgmask, axis, dpi, filename=None, orig_shape=
     scale = orig_shape[1] / gray_s.shape[1] if orig_shape else 2.0
     full_w = Ws * scale
     full_h = Hs * scale
+    if debug_out is not None:
+        debug_out["Hs"] = int(Hs)
+        debug_out["Ws"] = int(Ws)
+        debug_out["axis"] = axis
+        debug_out["dpi"] = float(dpi)
+        debug_out["scale"] = float(scale)
+        debug_out["full_w"] = float(full_w)
+        debug_out["full_h"] = float(full_h)
+        if orig_shape is not None:
+            debug_out["orig_shape"] = [int(orig_shape[0]), int(orig_shape[1])]
 
     def halves_plausible_at(s):
         lw, rw = s, Ws - s
@@ -466,6 +485,11 @@ def find_boundary(gray_s, color_s, bgmask, axis, dpi, filename=None, orig_shape=
     if structural is not None:
         seam = int(np.clip(structural, 1, Ws - 2))
         log_debug(filename, axis, "stage=STRUCTURAL")
+        if debug_out is not None:
+            debug_out["reason"] = "STRUCTURAL"
+            debug_out["chosen_split"] = int(seam)
+            debug_out["chosen_stage"] = "STRUCTURAL"
+            debug_out["chosen_confidence"] = 1.0
         return SeamResult(seam, 1.0, "STRUCTURAL"), "STRUCTURAL"
 
     band = slice(int(0.15 * Hs), int(0.85 * Hs))
@@ -475,6 +499,14 @@ def find_boundary(gray_s, color_s, bgmask, axis, dpi, filename=None, orig_shape=
     margin = max(4, int(0.07 * Ws))
     idx = np.arange(margin, Ws - margin)
     if idx.size == 0:
+        if debug_out is not None:
+            debug_out["margin"] = int(margin)
+            debug_out["band"] = [int(band.start), int(band.stop)]
+            debug_out["candidate_idx"] = idx.astype(int).tolist()
+            debug_out["reason"] = "geometry-too-narrow"
+            debug_out["chosen_split"] = None
+            debug_out["chosen_stage"] = None
+            debug_out["chosen_confidence"] = None
         return None, "geometry-too-narrow"
 
     edge = vertical_edge_map(gray_s)[band]
@@ -511,6 +543,22 @@ def find_boundary(gray_s, color_s, bgmask, axis, dpi, filename=None, orig_shape=
         geom_ok
     )
 
+    if debug_out is not None:
+        debug_out["margin"] = int(margin)
+        debug_out["band"] = [int(band.start), int(band.stop)]
+        debug_out["bw"] = int(bw)
+        debug_out["bg_ratio"] = bg_ratio.tolist()
+        debug_out["ink_ratio"] = ink_ratio.tolist()
+        debug_out["seam_align"] = seam_align.tolist()
+        debug_out["strong_align"] = strong_align.tolist()
+        debug_out["geom_ok"] = geom_ok.astype(bool).tolist()
+        debug_out["valid"] = valid.astype(bool).tolist()
+        debug_out["candidate_idx"] = idx.astype(int).tolist()
+        debug_out["anchor"] = int(anchor)
+        debug_out["dissim"] = dissim.tolist()
+        debug_out["mean_l"] = mean_l.tolist()
+        debug_out["mean_r"] = mean_r.tolist()
+
     if np.any(valid):
         score = bg_ratio[idx] * valid
         best = np.argmax(score)
@@ -541,6 +589,15 @@ def find_boundary(gray_s, color_s, bgmask, axis, dpi, filename=None, orig_shape=
         else:
             log_debug(filename, axis, f"retry sweep seam={best_retry} score={best_score:.3f}")
 
+        if debug_out is not None:
+            debug_out["reason"] = "STRICT_HEURISTIC"
+            debug_out["chosen_split"] = int(final_split)
+            debug_out["chosen_stage"] = "STRICT_HEURISTIC"
+            debug_out["chosen_confidence"] = float(final_confidence)
+            debug_out["strict_best_split"] = int(split)
+            debug_out["strict_best_confidence"] = float(confidence)
+            debug_out["retry_best_split"] = int(best_retry) if best_retry is not None else None
+            debug_out["retry_best_score"] = float(best_score) if best_retry is not None else None
         return SeamResult(int(final_split), final_confidence, "STRICT_HEURISTIC"), "STRICT_HEURISTIC"
 
     # Stage C — Geometry anchored fallback
@@ -550,6 +607,11 @@ def find_boundary(gray_s, color_s, bgmask, axis, dpi, filename=None, orig_shape=
             axis,
             f"stage=GEOMETRY_FALLBACK anchor={anchor} bg_ratio={bg_ratio[anchor]:.3f}"
         )
+        if debug_out is not None:
+            debug_out["reason"] = "GEOMETRY_FALLBACK"
+            debug_out["chosen_split"] = int(anchor)
+            debug_out["chosen_stage"] = "GEOMETRY_FALLBACK"
+            debug_out["chosen_confidence"] = 0.20
         return SeamResult(int(anchor), 0.20, "GEOMETRY_FALLBACK"), "GEOMETRY_FALLBACK"
 
     # Stage D — Forced geometry split
@@ -567,9 +629,23 @@ def find_boundary(gray_s, color_s, bgmask, axis, dpi, filename=None, orig_shape=
             "stage=FORCED_GRID_SPLIT (geometry_center_ok=%s, grid_plausible=%s)" %
             (geometry_center_ok, grid_plausible)
         )
+        if debug_out is not None:
+            debug_out["reason"] = "FORCED_GRID_SPLIT"
+            debug_out["chosen_split"] = int(center)
+            debug_out["chosen_stage"] = "FORCED_GRID_SPLIT"
+            debug_out["chosen_confidence"] = 0.10
+            debug_out["geometry_center_ok"] = bool(geometry_center_ok)
+            debug_out["grid_plausible"] = bool(grid_plausible)
         return SeamResult(int(center), 0.10, "FORCED_GRID_SPLIT"), "FORCED_GRID_SPLIT"
 
     log_debug(filename, axis, "no valid seam candidates after staged search (geometry rejected)")
+    if debug_out is not None:
+        debug_out["reason"] = "geometry-invalid"
+        debug_out["chosen_split"] = None
+        debug_out["chosen_stage"] = None
+        debug_out["chosen_confidence"] = None
+        debug_out["geometry_center_ok"] = bool(geometry_center_ok)
+        debug_out["grid_plausible"] = bool(grid_plausible)
     return None, "geometry-invalid"
 
 
@@ -685,6 +761,7 @@ def split_once(
             f"starting split: size={img.size}, dpi={ctx.dpi:.1f}, scale={ctx.dpi_scale:.2f}"
         )
 
+    W, H = img.size
     color = np.array(img.convert("RGB"))
     gray = np.array(img.convert("L"))
 
@@ -697,6 +774,41 @@ def split_once(
 
     scale = gray.shape[1] / gray_s.shape[1]
     bgmask = build_bgmask(gray_s)
+    debug_out = {} if debug_dir is not None else None
+
+    def _write_seam_profiles(out_dir: Path, data: dict):
+        (out_dir / "seam_profiles.json").write_text(json.dumps(data, indent=2))
+        try:
+            plot_w = int(data.get("Ws", W))
+            plot_h = 200
+            plot_img = Image.new("RGB", (plot_w, plot_h), (255, 255, 255))
+            plot_draw = ImageDraw.Draw(plot_img)
+
+            def _draw_series(values, color):
+                if not values:
+                    return
+                min_v = float(min(values))
+                max_v = float(max(values))
+                span = max(max_v - min_v, max(abs(max_v), 1.0))
+                scale_y = (plot_h - 20) / span
+                pts = []
+                for x, v in enumerate(values):
+                    if x >= plot_w:
+                        break
+                    y = plot_h - 10 - int((float(v) - min_v) * scale_y)
+                    pts.append((x, y))
+                if len(pts) >= 2:
+                    plot_draw.line(pts, fill=color, width=1)
+
+            _draw_series(data.get("bg_ratio", []), (0, 128, 0))
+            _draw_series(data.get("ink_ratio", []), (128, 0, 0))
+            _draw_series(data.get("seam_align", []), (0, 0, 255))
+            _draw_series(data.get("strong_align", []), (255, 165, 0))
+
+            plot_img.save(out_dir / "seam_profiles_plot.png")
+        except Exception:
+            pass
+
     seam_result, reason = find_boundary(
         gray_s,
         color_s,
@@ -704,12 +816,20 @@ def split_once(
         axis,
         ctx.dpi,
         filename,
-        gray.shape
+        gray.shape,
+        debug_out=debug_out,
     )
 
     if seam_result is None:
         log_debug(filename, axis, f"no split found (reason={reason}, dpi={ctx.dpi:.1f})")
         if reason == "geometry-invalid":
+            if debug_dir is not None and debug_out is not None:
+                debug_dir.mkdir(parents=True, exist_ok=True)
+                debug_out.setdefault("reason", reason)
+                debug_out["final_stage_used"] = "GEOMETRY_INVALID"
+                debug_out["overlap_px"] = None
+                debug_out["scale_used"] = float(scale)
+                _write_seam_profiles(debug_dir, debug_out)
             return [img.copy()]
 
         fallback_split = int(round((gray_s.shape[1] // 2) * scale))
@@ -720,10 +840,20 @@ def split_once(
         )
         split = fallback_split
         stage_used = "FORCED_FALLBACK"
+        if debug_out is not None:
+            debug_out.setdefault("reason", reason)
+            debug_out["chosen_split"] = int(round(split / scale))
+            debug_out["chosen_stage"] = stage_used
+            debug_out["chosen_confidence"] = None
     else:
         split_s = seam_result.position
         split = int(round(split_s * scale))
         stage_used = seam_result.stage
+        if debug_out is not None:
+            debug_out.setdefault("reason", reason)
+            debug_out.setdefault("chosen_split", int(split_s))
+            debug_out.setdefault("chosen_stage", stage_used)
+            debug_out.setdefault("chosen_confidence", seam_result.confidence)
     overlap = max(16, int(0.01 * gray.shape[1]))
 
     if ctx.debug:
@@ -791,6 +921,12 @@ def split_once(
             "box_b": box_b,
         }
         (debug_dir / "seam_meta.json").write_text(json.dumps(seam_meta, indent=2))
+        if debug_out is not None:
+            debug_out["final_split_px_fullres"] = int(split)
+            debug_out["final_stage_used"] = stage_used
+            debug_out["overlap_px"] = int(overlap)
+            debug_out["scale_used"] = float(scale)
+            _write_seam_profiles(debug_dir, debug_out)
 
     return [crop_a, crop_b]
 
