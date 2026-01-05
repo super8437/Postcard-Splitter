@@ -779,7 +779,7 @@ def split_once(
     debug_out = {} if debug_dir is not None else None
 
     def _write_seam_profiles(out_dir: Path, data: dict):
-        (out_dir / "seam_profiles.json").write_text(json.dumps(data, indent=2))
+        (out_dir / "seam_profiles.json").write_text(json.dumps(data, indent=2), encoding="utf-8")
         try:
             plot_w = int(data.get("Ws", W))
             plot_h = 200
@@ -890,8 +890,18 @@ def split_once(
                 cand_split_s = int(round(cand / scale))
                 cand_bg_ratio = None
                 try:
-                    band_slice = slice(max(0, cand_split_s - 3), min(bgmask.shape[1], cand_split_s + 3))
-                    bg_band = bgmask[:, band_slice]
+                    if axis == "vertical":
+                        band_slice = slice(
+                            max(0, cand_split_s - 3),
+                            min(bgmask.shape[1], cand_split_s + 3),
+                        )
+                        bg_band = bgmask[:, band_slice]
+                    else:
+                        band_slice = slice(
+                            max(0, cand_split_s - 3),
+                            min(bgmask.shape[0], cand_split_s + 3),
+                        )
+                        bg_band = bgmask[band_slice, :]
                     cand_bg_ratio = float(np.mean(bg_band)) if bg_band.size else None
                 except Exception:
                     cand_bg_ratio = None
@@ -953,40 +963,52 @@ def split_once(
         crop_b = img.crop((max(0, split - overlap), 0, img.width, img.height))
 
     if debug_dir is not None:
-        debug_dir.mkdir(parents=True, exist_ok=True)
-        img.save(debug_dir / "stage_input.png")
+        def _safe_debug_write(op):
+            try:
+                op()
+            except Exception as e:
+                if ctx.debug:
+                    log_debug(filename, axis, f"debug write failed: {e!r}")
+                else:
+                    print(f"[WARN seam-debug] debug write failed: {e!r}", file=sys.stderr)
 
+        _safe_debug_write(lambda: debug_dir.mkdir(parents=True, exist_ok=True))
+        _safe_debug_write(lambda: img.save(debug_dir / "stage_input.png"))
         W, H = img.size
-        draw_img = img.convert("RGB").copy()
-        draw = ImageDraw.Draw(draw_img)
 
-        if axis == "horizontal":
-            seam_line = ((0, split), (W, split))
-            band_top = max(0, split - overlap)
-            band_bottom = min(H, split + overlap)
-            box_a = (0, 0, W, split + overlap)
-            box_b = (0, max(0, split - overlap), W, H)
+        def _save_overlay():
+            draw_img = img.convert("RGB").copy()
+            draw = ImageDraw.Draw(draw_img)
 
-            draw.line(seam_line, fill=(255, 0, 0), width=2)
-            draw.line(((0, band_top), (W, band_top)), fill=(255, 255, 0), width=1)
-            draw.line(((0, band_bottom), (W, band_bottom)), fill=(255, 255, 0), width=1)
-        else:
-            seam_line = ((split, 0), (split, H))
-            band_left = max(0, split - overlap)
-            band_right = min(W, split + overlap)
-            box_a = (0, 0, split + overlap, H)
-            box_b = (max(0, split - overlap), 0, W, H)
+            if axis == "horizontal":
+                seam_line = ((0, split), (W, split))
+                band_top = max(0, split - overlap)
+                band_bottom = min(H, split + overlap)
+                box_a = (0, 0, W, split + overlap)
+                box_b = (0, max(0, split - overlap), W, H)
 
-            draw.line(seam_line, fill=(255, 0, 0), width=2)
-            draw.line(((band_left, 0), (band_left, H)), fill=(255, 255, 0), width=1)
-            draw.line(((band_right, 0), (band_right, H)), fill=(255, 255, 0), width=1)
+                draw.line(seam_line, fill=(255, 0, 0), width=2)
+                draw.line(((0, band_top), (W, band_top)), fill=(255, 255, 0), width=1)
+                draw.line(((0, band_bottom), (W, band_bottom)), fill=(255, 255, 0), width=1)
+            else:
+                seam_line = ((split, 0), (split, H))
+                band_left = max(0, split - overlap)
+                band_right = min(W, split + overlap)
+                box_a = (0, 0, split + overlap, H)
+                box_b = (max(0, split - overlap), 0, W, H)
 
-        draw.rectangle(box_a, outline=(0, 255, 0), width=2)
-        draw.rectangle(box_b, outline=(0, 0, 255), width=2)
+                draw.line(seam_line, fill=(255, 0, 0), width=2)
+                draw.line(((band_left, 0), (band_left, H)), fill=(255, 255, 0), width=1)
+                draw.line(((band_right, 0), (band_right, H)), fill=(255, 255, 0), width=1)
 
-        draw_img.save(debug_dir / "seam_overlay.png")
-        crop_a.save(debug_dir / "out_a.png")
-        crop_b.save(debug_dir / "out_b.png")
+            draw.rectangle(box_a, outline=(0, 255, 0), width=2)
+            draw.rectangle(box_b, outline=(0, 0, 255), width=2)
+
+            draw_img.save(debug_dir / "seam_overlay.png")
+
+        _safe_debug_write(_save_overlay)
+        _safe_debug_write(lambda: crop_a.save(debug_dir / "out_a.png"))
+        _safe_debug_write(lambda: crop_b.save(debug_dir / "out_b.png"))
 
         seam_meta = {
             "axis": axis,
@@ -1000,13 +1022,13 @@ def split_once(
             "box_a": box_a,
             "box_b": box_b,
         }
-        (debug_dir / "seam_meta.json").write_text(json.dumps(seam_meta, indent=2))
+        _safe_debug_write(lambda: (debug_dir / "seam_meta.json").write_text(json.dumps(seam_meta, indent=2), encoding="utf-8"))
         if debug_out is not None:
             debug_out["final_split_px_fullres"] = int(split)
             debug_out["final_stage_used"] = stage_used
             debug_out["overlap_px"] = int(overlap)
             debug_out["scale_used"] = float(scale)
-            _write_seam_profiles(debug_dir, debug_out)
+            _safe_debug_write(lambda: _write_seam_profiles(debug_dir, debug_out))
 
     return [crop_a, crop_b]
 
