@@ -28,6 +28,7 @@ class SplitContext:
     dpi: float
     debug: bool
     safer_seams: bool = False
+    seam_cv2_mask: bool = False
 
     @property
     def dpi_scale(self):
@@ -776,7 +777,42 @@ def split_once(
 
     scale = gray.shape[1] / gray_s.shape[1]
     bgmask = build_bgmask(gray_s)
+    bgmask_for_boundary = bgmask
     debug_out = {} if debug_dir is not None else None
+
+    if ctx.seam_cv2_mask:
+        mask_debug_enabled = debug_dir is not None
+
+        def _save_mask(mask: np.ndarray, name: str):
+            if not mask_debug_enabled:
+                return
+            try:
+                debug_dir.mkdir(parents=True, exist_ok=True)
+                mask_img = Image.fromarray(np.where(mask, 255, 0).astype(np.uint8, copy=False))
+                mask_img.save(debug_dir / name)
+            except Exception as e:
+                if ctx.debug:
+                    log_debug(filename, axis, f"mask debug save failed: {e!r}")
+
+        _save_mask(bgmask, "mask_bg_original.png")
+
+        try:
+            from postcard_split import cv2_crop
+
+            fgmask = np.logical_not(bgmask)
+            fgmask_clean = cv2_crop.clean_fgmask_cv2(fgmask)
+            try:
+                fgmask_clean = cv2_crop.fill_holes_cv2(fgmask_clean)
+            except Exception:
+                pass
+
+            bgmask_for_boundary = np.logical_not(fgmask_clean)
+        except Exception as e:
+            bgmask_for_boundary = bgmask
+            if ctx.debug:
+                log_debug(filename, axis, f"cv2 mask cleanup failed; using original mask ({e!r})")
+        finally:
+            _save_mask(bgmask_for_boundary, "mask_bg_after_cv2.png")
 
     def _write_seam_profiles(out_dir: Path, data: dict):
         (out_dir / "seam_profiles.json").write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -814,7 +850,7 @@ def split_once(
     seam_result, reason = find_boundary(
         gray_s,
         color_s,
-        bgmask,
+        bgmask_for_boundary,
         axis,
         ctx.dpi,
         filename,
@@ -1068,6 +1104,11 @@ def main():
         help="Attempt a conservative cv2-based crop after deskewing (fails safe).",
     )
     parser.add_argument(
+        "--seam-cv2-mask",
+        action="store_true",
+        help="Clean seam masks using OpenCV morphology before boundary search (requires opencv).",
+    )
+    parser.add_argument(
         "inputs",
         nargs="+",
         help="Image files or directories containing scans.",
@@ -1104,6 +1145,7 @@ def main():
             dpi=get_effective_dpi(img),
             debug=DEBUG_SEAMS,
             safer_seams=args.safer_seams,
+            seam_cv2_mask=args.seam_cv2_mask,
         )
         if DEBUG_SEAMS:
             log_debug(
