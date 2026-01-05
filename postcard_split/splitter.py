@@ -1,4 +1,5 @@
 import argparse
+import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -6,7 +7,7 @@ from typing import Iterable, Optional, Tuple
 
 import numpy as np
 import scipy.ndimage as ndi
-from PIL import Image
+from PIL import Image, ImageDraw
 
 import postcard_split.cv2_bridge as cv2_bridge
 
@@ -668,7 +669,13 @@ def deskew_postcard(img: Image.Image, filename=None, context: Optional[SplitCont
 # Axis-aware split
 # ============================================================
 
-def split_once(img, axis, filename=None, context: Optional[SplitContext] = None):
+def split_once(
+    img,
+    axis,
+    filename=None,
+    context: Optional[SplitContext] = None,
+    debug_dir: Optional[Path] = None,
+):
     ctx = context or SplitContext(dpi=get_effective_dpi(img), debug=DEBUG_SEAMS)
 
     if ctx.debug:
@@ -726,16 +733,66 @@ def split_once(img, axis, filename=None, context: Optional[SplitContext] = None)
             f"split chosen at {split}px (stage={stage_used}, overlap={overlap}px)"
         )
 
+    crop_a: Image.Image
+    crop_b: Image.Image
     if axis == "horizontal":
-        return [
-            img.crop((0, 0, img.width, split + overlap)),
-            img.crop((0, max(0, split - overlap), img.width, img.height))
-        ]
+        crop_a = img.crop((0, 0, img.width, split + overlap))
+        crop_b = img.crop((0, max(0, split - overlap), img.width, img.height))
+    else:
+        crop_a = img.crop((0, 0, split + overlap, img.height))
+        crop_b = img.crop((max(0, split - overlap), 0, img.width, img.height))
 
-    return [
-        img.crop((0, 0, split + overlap, img.height)),
-        img.crop((max(0, split - overlap), 0, img.width, img.height))
-    ]
+    if debug_dir is not None:
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        img.save(debug_dir / "stage_input.png")
+
+        W, H = img.size
+        draw_img = img.convert("RGB").copy()
+        draw = ImageDraw.Draw(draw_img)
+
+        if axis == "horizontal":
+            seam_line = ((0, split), (W, split))
+            band_top = max(0, split - overlap)
+            band_bottom = min(H, split + overlap)
+            box_a = (0, 0, W, split + overlap)
+            box_b = (0, max(0, split - overlap), W, H)
+
+            draw.line(seam_line, fill=(255, 0, 0), width=2)
+            draw.line(((0, band_top), (W, band_top)), fill=(255, 255, 0), width=1)
+            draw.line(((0, band_bottom), (W, band_bottom)), fill=(255, 255, 0), width=1)
+        else:
+            seam_line = ((split, 0), (split, H))
+            band_left = max(0, split - overlap)
+            band_right = min(W, split + overlap)
+            box_a = (0, 0, split + overlap, H)
+            box_b = (max(0, split - overlap), 0, W, H)
+
+            draw.line(seam_line, fill=(255, 0, 0), width=2)
+            draw.line(((band_left, 0), (band_left, H)), fill=(255, 255, 0), width=1)
+            draw.line(((band_right, 0), (band_right, H)), fill=(255, 255, 0), width=1)
+
+        draw.rectangle(box_a, outline=(0, 255, 0), width=2)
+        draw.rectangle(box_b, outline=(0, 0, 255), width=2)
+
+        draw_img.save(debug_dir / "seam_overlay.png")
+        crop_a.save(debug_dir / "out_a.png")
+        crop_b.save(debug_dir / "out_b.png")
+
+        seam_meta = {
+            "axis": axis,
+            "width": W,
+            "height": H,
+            "split_px": split,
+            "overlap_px": overlap,
+            "stage_used": stage_used,
+            "reason": reason,
+            "confidence": seam_result.confidence if seam_result is not None else None,
+            "box_a": box_a,
+            "box_b": box_b,
+        }
+        (debug_dir / "seam_meta.json").write_text(json.dumps(seam_meta, indent=2))
+
+    return [crop_a, crop_b]
 
 
 # ============================================================
@@ -751,6 +808,11 @@ def main():
         "--debug-seams",
         action="store_true",
         help="Enable verbose seam detection logging.",
+    )
+    parser.add_argument(
+        "--debug-seam-images",
+        action="store_true",
+        help="Write seam debug artifacts (images + metadata).",
     )
     parser.add_argument(
         "--use-cv2",
@@ -812,9 +874,20 @@ def main():
         out_dir = out_root / f"pair_{pair_id:03d}"
         out_dir.mkdir(exist_ok=True)
 
+        seam_root = None
+        if args.debug_seam_images:
+            seam_root = out_dir / "_debug" / "_seams" / scan_path.stem
+            seam_root.mkdir(parents=True, exist_ok=True)
+            img.save(seam_root / "stage_scan.png")
+
         parts = []
-        for half in split_once(img, "horizontal", scan_path.name, context):
-            parts.extend(split_once(half, "vertical", scan_path.name, context))
+        h_debug_dir = seam_root / "split_h" if seam_root is not None else None
+        halves = split_once(img, "horizontal", scan_path.name, context, debug_dir=h_debug_dir)
+        for half_idx, half in enumerate(halves):
+            v_debug_dir = None
+            if seam_root is not None:
+                v_debug_dir = seam_root / ("split_v_top" if half_idx == 0 else "split_v_bottom")
+            parts.extend(split_once(half, "vertical", scan_path.name, context, debug_dir=v_debug_dir))
 
         if len(parts) != 4:
             print(f"WARNING: {scan_path.name} produced {len(parts)} parts")
