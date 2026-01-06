@@ -788,7 +788,8 @@ def split_once(
                 return
             try:
                 debug_dir.mkdir(parents=True, exist_ok=True)
-                mask_img = Image.fromarray(np.where(mask, 255, 0).astype(np.uint8, copy=False))
+                mask_to_save = mask.T if axis == "horizontal" else mask
+                mask_img = Image.fromarray(np.where(mask_to_save, 255, 0).astype(np.uint8, copy=False))
                 mask_img.save(debug_dir / name)
             except Exception as e:
                 if ctx.debug:
@@ -862,12 +863,16 @@ def split_once(
         log_debug(filename, axis, f"no split found (reason={reason}, dpi={ctx.dpi:.1f})")
         if reason == "geometry-invalid":
             if debug_dir is not None and debug_out is not None:
-                debug_dir.mkdir(parents=True, exist_ok=True)
-                debug_out.setdefault("reason", reason)
-                debug_out["final_stage_used"] = "GEOMETRY_INVALID"
-                debug_out["overlap_px"] = None
-                debug_out["scale_used"] = float(scale)
-                _write_seam_profiles(debug_dir, debug_out)
+                try:
+                    debug_dir.mkdir(parents=True, exist_ok=True)
+                    debug_out.setdefault("reason", reason)
+                    debug_out["final_stage_used"] = "GEOMETRY_INVALID"
+                    debug_out["overlap_px"] = None
+                    debug_out["scale_used"] = float(scale)
+                    _write_seam_profiles(debug_dir, debug_out)
+                except Exception as e:
+                    if ctx.debug:
+                        log_debug(filename, axis, f"geometry-invalid debug write failed: {e!r}")
             return [img.copy()]
 
         fallback_split = int(round((gray_s.shape[1] // 2) * scale))
@@ -929,15 +934,15 @@ def split_once(
                     if axis == "vertical":
                         band_slice = slice(
                             max(0, cand_split_s - 3),
-                            min(bgmask.shape[1], cand_split_s + 3),
+                            min(bgmask_for_boundary.shape[1], cand_split_s + 3),
                         )
-                        bg_band = bgmask[:, band_slice]
+                        bg_band = bgmask_for_boundary[:, band_slice]
                     else:
                         band_slice = slice(
                             max(0, cand_split_s - 3),
-                            min(bgmask.shape[0], cand_split_s + 3),
+                            min(bgmask_for_boundary.shape[0], cand_split_s + 3),
                         )
-                        bg_band = bgmask[band_slice, :]
+                        bg_band = bgmask_for_boundary[band_slice, :]
                     cand_bg_ratio = float(np.mean(bg_band)) if bg_band.size else None
                 except Exception:
                     cand_bg_ratio = None
@@ -989,14 +994,17 @@ def split_once(
             f"split chosen at {split}px (stage={stage_used}, overlap={overlap}px)"
         )
 
+    if axis == "horizontal":
+        box_a = (0, 0, W, split + overlap)
+        box_b = (0, max(0, split - overlap), W, H)
+    else:
+        box_a = (0, 0, split + overlap, H)
+        box_b = (max(0, split - overlap), 0, W, H)
+
     crop_a: Image.Image
     crop_b: Image.Image
-    if axis == "horizontal":
-        crop_a = img.crop((0, 0, img.width, split + overlap))
-        crop_b = img.crop((0, max(0, split - overlap), img.width, img.height))
-    else:
-        crop_a = img.crop((0, 0, split + overlap, img.height))
-        crop_b = img.crop((max(0, split - overlap), 0, img.width, img.height))
+    crop_a = img.crop(box_a)
+    crop_b = img.crop(box_b)
 
     if debug_dir is not None:
         def _safe_debug_write(op):
@@ -1020,8 +1028,6 @@ def split_once(
                 seam_line = ((0, split), (W, split))
                 band_top = max(0, split - overlap)
                 band_bottom = min(H, split + overlap)
-                box_a = (0, 0, W, split + overlap)
-                box_b = (0, max(0, split - overlap), W, H)
 
                 draw.line(seam_line, fill=(255, 0, 0), width=2)
                 draw.line(((0, band_top), (W, band_top)), fill=(255, 255, 0), width=1)
@@ -1030,15 +1036,26 @@ def split_once(
                 seam_line = ((split, 0), (split, H))
                 band_left = max(0, split - overlap)
                 band_right = min(W, split + overlap)
-                box_a = (0, 0, split + overlap, H)
-                box_b = (max(0, split - overlap), 0, W, H)
 
                 draw.line(seam_line, fill=(255, 0, 0), width=2)
                 draw.line(((band_left, 0), (band_left, H)), fill=(255, 255, 0), width=1)
                 draw.line(((band_right, 0), (band_right, H)), fill=(255, 255, 0), width=1)
 
-            draw.rectangle(box_a, outline=(0, 255, 0), width=2)
-            draw.rectangle(box_b, outline=(0, 0, 255), width=2)
+            draw_box_a = (
+                max(0, box_a[0]),
+                max(0, box_a[1]),
+                min(W, box_a[2]),
+                min(H, box_a[3]),
+            )
+            draw_box_b = (
+                max(0, box_b[0]),
+                max(0, box_b[1]),
+                min(W, box_b[2]),
+                min(H, box_b[3]),
+            )
+
+            draw.rectangle(draw_box_a, outline=(0, 255, 0), width=2)
+            draw.rectangle(draw_box_b, outline=(0, 0, 255), width=2)
 
             draw_img.save(debug_dir / "seam_overlay.png")
 
