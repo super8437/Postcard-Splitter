@@ -29,6 +29,7 @@ class SplitContext:
     debug: bool
     safer_seams: bool = False
     seam_cv2_mask: bool = False
+    seam_cv2_gap: bool = False
 
     @property
     def dpi_scale(self):
@@ -437,7 +438,17 @@ def detect_card_boxes(gray_s, bgmask, axis, dpi, filename=None):
     return (gap_start + gap_end) // 2
 
 
-def find_boundary(gray_s, color_s, bgmask, axis, dpi, filename=None, orig_shape=None, debug_out: dict | None = None):
+def find_boundary(
+    gray_s,
+    color_s,
+    bgmask,
+    axis,
+    dpi,
+    filename=None,
+    orig_shape=None,
+    debug_out: dict | None = None,
+    use_cv2_gap: bool = False,
+):
     Hs, Ws = gray_s.shape
     if Hs < 40 or Ws < 40:
         if debug_out is not None:
@@ -560,6 +571,43 @@ def find_boundary(gray_s, color_s, bgmask, axis, dpi, filename=None, orig_shape=
         debug_out["dissim"] = dissim.tolist()
         debug_out["mean_l"] = mean_l.tolist()
         debug_out["mean_r"] = mean_r.tolist()
+
+    dt_result = None
+    if use_cv2_gap:
+        try:
+            cv2 = cv2_bridge.require_cv2()
+            bg_band = bgmask[band].astype(np.uint8, copy=False)
+            dt = cv2.distanceTransform(bg_band, cv2.DIST_L2, 3)
+            dt_percentile = np.percentile(dt, 80, axis=0)
+            dt_score = np.full(Ws, -np.inf, dtype=float)
+            dt_score[:dt_percentile.shape[0]] = dt_percentile
+
+            candidates_geom = idx[valid & geom_ok]
+            candidates = candidates_geom if candidates_geom.size > 0 else idx[valid]
+
+            if candidates.size > 0:
+                dt_best = int(candidates[np.argmax(dt_score[candidates])])
+                best_score = float(dt_score[dt_best]) if np.isfinite(dt_score[dt_best]) else float("-inf")
+                if np.isfinite(best_score) and best_score > 0:
+                    confidence = float(seam_align[dt_best]) if seam_align.size > dt_best else 0.0
+                    dt_result = SeamResult(int(dt_best), confidence, "CV2_GAP_DT")
+                    log_debug(filename, axis, f"stage=CV2_GAP_DT split={dt_best} dt_score={best_score:.3f}")
+                    if debug_out is not None:
+                        debug_out["dt_best"] = int(dt_best)
+            if debug_out is not None:
+                debug_out["dt_score"] = dt_score.tolist()
+        except Exception as e:
+            if debug_out is not None:
+                debug_out["cv2_gap_error"] = repr(e)
+            if DEBUG_SEAMS:
+                log_debug(filename, axis, f"cv2-gap failed: {e!r}")
+    if dt_result is not None:
+        if debug_out is not None:
+            debug_out["reason"] = "CV2_GAP_DT"
+            debug_out["chosen_split"] = int(dt_result.position)
+            debug_out["chosen_stage"] = dt_result.stage
+            debug_out["chosen_confidence"] = float(dt_result.confidence)
+        return dt_result, "CV2_GAP_DT"
 
     if np.any(valid):
         score = bg_ratio[idx] * valid
@@ -857,6 +905,7 @@ def split_once(
         filename,
         gray.shape,
         debug_out=debug_out,
+        use_cv2_gap=ctx.seam_cv2_gap,
     )
 
     if seam_result is None:
@@ -1126,6 +1175,11 @@ def main():
         help="Clean seam masks using OpenCV morphology before boundary search (requires opencv).",
     )
     parser.add_argument(
+        "--seam-cv2-gap",
+        action="store_true",
+        help="Use OpenCV distance transform gap scoring for seam selection (requires opencv).",
+    )
+    parser.add_argument(
         "inputs",
         nargs="+",
         help="Image files or directories containing scans.",
@@ -1163,6 +1217,7 @@ def main():
             debug=DEBUG_SEAMS,
             safer_seams=args.safer_seams,
             seam_cv2_mask=args.seam_cv2_mask,
+            seam_cv2_gap=args.seam_cv2_gap,
         )
         if DEBUG_SEAMS:
             log_debug(
